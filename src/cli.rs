@@ -38,6 +38,20 @@ enum Command {
     /// Validate Findings and open a Review session in the browser. Blocks until the Reviewer
     /// finishes, then prints the result JSON. Run it as a background task.
     Review(ReviewArgs),
+    /// Re-attach to a Review session: serve it again if no prr process is serving it, otherwise
+    /// wait for that process. Prints the result JSON when the session ends.
+    Wait {
+        id: String,
+        /// Print the URL instead of opening a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
+    /// List Review sessions as JSON.
+    Sessions {
+        /// Only sessions still open.
+        #[arg(long)]
+        open: bool,
+    },
     /// Print the JSON Schema of the findings file.
     Schema,
 }
@@ -78,6 +92,8 @@ pub fn run() -> i32 {
 fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Review(args) => review(args),
+        Command::Wait { id, no_open } => wait(&id, no_open),
+        Command::Sessions { open } => sessions(open),
         Command::Schema => {
             let schema = schemars::schema_for!(FindingBatch);
             println!("{}", serde_json::to_string_pretty(&schema)?);
@@ -131,6 +147,52 @@ fn review(args: ReviewArgs) -> Result<i32> {
     store.save(&session)?;
     let _lock = store.try_lock(&session.id)?.context("could not lock the new session")?;
     run_server(session, store, repo, !args.no_open)
+}
+
+fn wait(id: &str, no_open: bool) -> Result<i32> {
+    let store = Store::from_env()?;
+    let mut announced = false;
+    loop {
+        let session = store.load(id)?;
+        if !session.is_open() {
+            return print_result(&session);
+        }
+        if let Some(_lock) = store.try_lock(id)? {
+            // Re-read under the lock: the previous server may have finished in between.
+            let session = store.load(id)?;
+            if !session.is_open() {
+                return print_result(&session);
+            }
+            let repo = Repo::discover(&session.repo_root)?;
+            return run_server(session, store, repo, !no_open);
+        }
+        if !announced {
+            eprintln!("prr: session {id} is being served by another prr process; waiting for it to finish");
+            announced = true;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+fn sessions(open_only: bool) -> Result<i32> {
+    let rows: Vec<serde_json::Value> = Store::from_env()?
+        .list()?
+        .into_iter()
+        .filter(|s| !open_only || s.is_open())
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "status": s.status,
+                "target": s.target.label(),
+                "head_sha": s.head_sha,
+                "repo_root": s.repo_root,
+                "findings": s.entries.len(),
+                "unruled": s.unruled().len(),
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&rows)?);
+    Ok(exit::OK)
 }
 
 /// Serves the session until it ends, then prints the result and returns the exit code.

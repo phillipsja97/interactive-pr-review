@@ -171,3 +171,64 @@ fn second_review_of_same_change_exits_12() {
     first.child.kill().unwrap();
     first.child.wait().unwrap();
 }
+
+fn wait_cmd(state: &Path, id: &str) -> Command {
+    let mut c = prr();
+    c.env("PRR_STATE_DIR", state).args(["wait", id, "--no-open"]);
+    c
+}
+
+#[test]
+fn wait_resumes_a_killed_session_with_verdicts_intact() {
+    let (r, state) = (repo(), tempfile::tempdir().unwrap());
+    let f = findings_file(state.path(), "src/lib.rs");
+    let mut first = start(&mut review_cmd(r.path(), state.path(), &f, &[]));
+    post(&format!("{}f/0/ruling", first.url), &[("verdict", "nit"), ("comment", "Kept")]);
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
+
+    let listed = prr().env("PRR_STATE_DIR", state.path()).args(["sessions", "--open"]).output().unwrap();
+    let rows: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(rows[0]["id"], first.id.as_str());
+    assert_eq!(rows[0]["unruled"], 0);
+
+    let resumed = start(&mut wait_cmd(state.path(), &first.id));
+    assert_eq!(resumed.id, first.id);
+    let page = ureq::get(&resumed.url).call().unwrap().into_string().unwrap();
+    assert!(page.contains("Submit review"), "all Findings already have a Verdict, so it opens on submit");
+    post(&format!("{}submit", resumed.url), &[("summary", "")]);
+    let (code, result) = result_of(resumed.child);
+    assert_eq!(code, 0);
+    assert_eq!(result["findings"][0]["verdict"], "nit");
+    assert_eq!(result["findings"][0]["comment"], "Kept");
+
+    let again = wait_cmd(state.path(), &first.id).output().unwrap();
+    assert_eq!(again.status.code(), Some(0), "an ended session prints its result immediately");
+    let result: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(result["status"], "submitted");
+}
+
+#[test]
+fn wait_defers_to_a_live_server() {
+    let (r, state) = (repo(), tempfile::tempdir().unwrap());
+    let f = findings_file(state.path(), "src/lib.rs");
+    let run = start(&mut review_cmd(r.path(), state.path(), &f, &[]));
+    let waiter = wait_cmd(state.path(), &run.id).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    post(&format!("{}abandon", run.url), &[]);
+    let (code, result) = result_of(run.child);
+    assert_eq!(code, 11);
+    let out = waiter.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(11));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("being served by another prr process"));
+    let waited: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(waited, result);
+}
+
+#[test]
+fn wait_on_unknown_session_fails() {
+    let state = tempfile::tempdir().unwrap();
+    let out = wait_cmd(state.path(), "nope").output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no session `nope`"));
+}
