@@ -4,6 +4,7 @@ mod handlers;
 mod highlight;
 mod pages;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Request, State};
@@ -12,6 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::git::Repo;
@@ -141,6 +143,38 @@ async fn guard(State(state): State<AppState>, req: Request, next: Next) -> Respo
         return StatusCode::NOT_FOUND.into_response();
     }
     next.run(req).await
+}
+
+pub enum ServeEnd {
+    /// The Reviewer submitted or abandoned.
+    Finished(Session),
+    /// Ctrl-C; the session is left open on disk.
+    Interrupted(Session),
+}
+
+/// Serves `session` on a random localhost port until the Reviewer finishes or the process is interrupted.
+pub async fn serve_session(session: Session, store: Store, repo: Repo, open_browser: bool) -> anyhow::Result<ServeEnd> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let link = format!("http://127.0.0.1:{port}{}", url(&session.token, ""));
+    eprintln!("prr: session {}", session.id);
+    eprintln!("prr: open {link}");
+    let state = AppState::new(session, store, repo, port);
+    if open_browser && let Err(e) = webbrowser::open(&link) {
+        eprintln!("prr: could not open a browser ({e}); open the URL above yourself");
+    }
+    let interrupted = Arc::new(AtomicBool::new(false));
+    let flag = interrupted.clone();
+    let mut done = state.subscribe();
+    let shutdown = async move {
+        tokio::select! {
+            _ = done.wait_for(|d| *d) => {}
+            _ = tokio::signal::ctrl_c() => flag.store(true, Ordering::SeqCst),
+        }
+    };
+    axum::serve(listener, router(state.clone())).with_graceful_shutdown(shutdown).await?;
+    let session = state.snapshot();
+    Ok(if interrupted.load(Ordering::SeqCst) { ServeEnd::Interrupted(session) } else { ServeEnd::Finished(session) })
 }
 
 #[cfg(test)]
