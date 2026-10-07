@@ -467,4 +467,25 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(fx.store.load(&fx.id).unwrap().outcome.unwrap().state, None);
     }
+
+    #[tokio::test]
+    async fn rejected_ruling_keeps_what_the_reviewer_typed() {
+        let fx = fixture();
+        let (s, _, body) = fx.post("f/0/ruling", "verdict=dismiss&comment=MY+EDITED+TEXT&reason=").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("MY EDITED TEXT"), "{body}");
+        assert!(body.contains(r#"value="dismiss" data-key="d" checked"#), "{body}");
+    }
+
+    #[tokio::test]
+    async fn rejected_submit_keeps_summary_and_choices() {
+        let fx = fixture();
+        rule_all(&fx, "comment").await;
+        fx.repo.write("src/other.rs", "new\n");
+        fx.repo.commit("more work");
+        let (s, _, body) = fx.post("submit", "summary=Keep+this&approve=on").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("Keep this"), "{body}");
+        assert!(body.contains(r#"name="approve" checked"#), "{body}");
+    }
 }

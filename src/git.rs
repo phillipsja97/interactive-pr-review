@@ -51,7 +51,19 @@ impl Repo {
     pub fn diff_map(&self, base: &str, head: &str) -> Result<DiffMap> {
         let diff = run_git(
             &self.root,
-            &["-c", "core.quotePath=false", "diff", "--no-color", "--no-ext-diff", "-U3", base, head],
+            // Explicit prefixes override diff.noprefix / diff.dstPrefix in the user's config.
+            &[
+                "-c",
+                "core.quotePath=false",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "-U3",
+                base,
+                head,
+            ],
         )?;
         Ok(DiffMap::parse(&diff))
     }
@@ -87,7 +99,8 @@ impl DiffMap {
                 in_header = true;
                 path = None;
             } else if let Some(target) = line.strip_prefix("+++ ").filter(|_| in_header) {
-                let target = unquote(target);
+                // git appends a tab after paths that contain spaces.
+                let target = unquote(target.strip_suffix('\t').unwrap_or(target));
                 path = (target != "/dev/null").then(|| target.strip_prefix("b/").unwrap_or(target).to_string());
             } else if line.starts_with("@@ ") {
                 in_header = false;
@@ -180,5 +193,25 @@ deleted file mode 100644
         let map = t.repo().diff_map(&base, &head).unwrap();
         assert!(map.contains("src/lib.rs", 10, 12));
         assert!(!map.contains("src/lib.rs", 1, 2));
+    }
+
+    #[test]
+    fn diff_map_ignores_prefix_config_and_handles_spaced_paths() {
+        let t = crate::testutil::TestRepo::new();
+        t.write("my file.rs", "a\nb\nc\n");
+        t.write("b/inner.rs", "x\ny\n");
+        let base = t.commit("base");
+        t.write("my file.rs", "a\nB\nc\n");
+        t.write("b/inner.rs", "x\nY\n");
+        let head = t.commit("change");
+        let map = t.repo().diff_map(&base, &head).unwrap();
+        assert!(map.contains("my file.rs", 2, 2), "trailing tab after a spaced path");
+        for (key, value) in [("diff.dstPrefix", "new/"), ("diff.noprefix", "true")] {
+            t.git(&["config", key, value]);
+            let map = t.repo().diff_map(&base, &head).unwrap();
+            assert!(map.contains("my file.rs", 2, 2), "{key}");
+            assert!(map.contains("b/inner.rs", 2, 2), "{key}");
+            t.git(&["config", "--unset", key]);
+        }
     }
 }

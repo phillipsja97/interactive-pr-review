@@ -347,12 +347,36 @@ impl Store {
         Ok(self.sessions_dir().join(format!("{id}.{ext}")))
     }
 
+    /// Creates the sessions directory readable only by this user: session files hold the server token.
+    fn ensure_dir(&self) -> Result<()> {
+        let dir = self.sessions_dir();
+        fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    /// Opens `path` for writing, readable only by this user.
+    fn open_private(path: &std::path::Path, truncate: bool) -> Result<File> {
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(truncate);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        Ok(options.open(path)?)
+    }
+
     /// Writes atomically: a crash never leaves a half-written session.
     pub fn save(&self, session: &Session) -> Result<()> {
-        fs::create_dir_all(self.sessions_dir())?;
+        self.ensure_dir()?;
         let path = self.file(&session.id, "json")?;
         let tmp = self.file(&session.id, "json.tmp")?;
-        fs::write(&tmp, serde_json::to_vec_pretty(session)?)?;
+        std::io::Write::write_all(&mut Store::open_private(&tmp, true)?, &serde_json::to_vec_pretty(session)?)?;
         fs::rename(&tmp, &path).with_context(|| format!("saving {}", path.display()))?;
         Ok(())
     }
@@ -388,8 +412,8 @@ impl Store {
     /// An exclusive lock marking the session as served by this process; `None` if another process holds it.
     /// The lock is released when the returned file is dropped or the process exits.
     pub fn try_lock(&self, id: &str) -> Result<Option<File>> {
-        fs::create_dir_all(self.sessions_dir())?;
-        let file = OpenOptions::new().create(true).truncate(false).write(true).open(self.file(id, "lock")?)?;
+        self.ensure_dir()?;
+        let file = Store::open_private(&self.file(id, "lock")?, false)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(file)),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -538,5 +562,20 @@ mod tests {
         assert!(store.try_lock("abc").unwrap().is_none());
         drop(first);
         assert!(store.try_lock("abc").unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+        let s = session(vec![]);
+        store.save(&s).unwrap();
+        let _lock = store.try_lock(&s.id).unwrap();
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(dir.path().join("sessions")), 0o700);
+        assert_eq!(mode(dir.path().join(format!("sessions/{}.json", s.id))), 0o600);
+        assert_eq!(mode(dir.path().join(format!("sessions/{}.lock", s.id))), 0o600);
     }
 }

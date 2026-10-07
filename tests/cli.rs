@@ -239,3 +239,25 @@ fn guide_prints() {
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("prr review --findings"));
 }
+
+#[test]
+fn bad_export_path_fails_before_opening_a_session() {
+    let (r, state) = (repo(), tempfile::tempdir().unwrap());
+    let f = findings_file(state.path(), "src/lib.rs");
+    let mut child = review_cmd(r.path(), state.path(), &f, &["--export-md", "/nonexistent/dir/out.md"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            panic!("prr opened a session with an export path it can never write");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--export-md"));
+}

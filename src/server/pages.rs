@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use maud::{html, Markup, DOCTYPE};
 
-use super::handlers::NewFindingForm;
+use super::handlers::{NewFindingForm, RulingForm, SubmitForm};
 use super::highlight::code_block;
 use super::url;
 use crate::compose::ComposedReview;
@@ -72,7 +72,8 @@ pub(super) fn layout(s: &Session, title: &str, current: Option<usize>, body: Mar
     }
 }
 
-pub fn finding(s: &Session, idx: usize, error: Option<&str>) -> Markup {
+/// `form` carries what the Reviewer submitted when a ruling was rejected, so it is shown again instead of the saved values.
+pub fn finding(s: &Session, idx: usize, error: Option<&str>, form: Option<&RulingForm>) -> Markup {
     let t = &s.token;
     let e = &s.entries[idx];
     let prev = idx.checked_sub(1).map(|p| url(t, &format!("f/{p}")));
@@ -103,7 +104,7 @@ pub fn finding(s: &Session, idx: usize, error: Option<&str>) -> Markup {
                 @if let Some(code) = location_code { (code) }
             }
             @if let Some(f) = e.finding() { (finding_details(f, &e.excerpts)) }
-            (ruling_form(s, idx))
+            (ruling_form(s, idx, form))
         }
     };
     layout(s, &e.display_title(), Some(idx), body)
@@ -149,7 +150,7 @@ fn evidence_item(ev: &Evidence, resolved: Option<&String>) -> Markup {
     }
 }
 
-fn ruling_form(s: &Session, idx: usize) -> Markup {
+fn ruling_form(s: &Session, idx: usize, form: Option<&RulingForm>) -> Markup {
     let e = &s.entries[idx];
     let ruling = e.ruling.as_ref();
     let current = ruling.map(|r| r.verdict.key());
@@ -161,6 +162,15 @@ fn ruling_form(s: &Session, idx: usize) -> Markup {
     let escalate_to = match ruling.map(|r| &r.verdict) {
         Some(Verdict::Escalate { to }) => to.as_str(),
         _ => e.finding().and_then(|f| f.escalate_to.as_deref()).unwrap_or(""),
+    };
+    let (current, comment, reason, escalate_to) = match form {
+        Some(f) => (
+            Some(f.verdict.as_str()).filter(|v| !v.is_empty()),
+            f.comment.as_str(),
+            f.reason.as_str(),
+            f.escalate_to.as_str(),
+        ),
+        None => (current, comment, reason, escalate_to),
     };
     html! {
         form.ruling method="post" action=(url(&s.token, &format!("f/{idx}/ruling"))) {
@@ -208,7 +218,14 @@ pub fn new_finding(s: &Session, form: &NewFindingForm, error: Option<&str>) -> M
     layout(s, "Add your own finding", None, body)
 }
 
-pub fn submit(s: &Session, preview: Option<&ComposedReview>, stale: bool, error: Option<&str>) -> Markup {
+/// `form` carries what the Reviewer submitted when a submit was rejected, so it is shown again.
+pub fn submit(
+    s: &Session,
+    preview: Option<&ComposedReview>,
+    stale: bool,
+    error: Option<&str>,
+    form: Option<&SubmitForm>,
+) -> Markup {
     let t = &s.token;
     let unruled = s.unruled();
     let has_block = s.entries.iter().any(|e| e.ruling.as_ref().is_some_and(|r| r.verdict == Verdict::Block));
@@ -228,11 +245,11 @@ pub fn submit(s: &Session, preview: Option<&ComposedReview>, stale: bool, error:
             form.submit method="post" action=(url(t, "submit")) {
                 @if stale {
                     p.warning { "The change has new commits since these Findings were proposed; some may no longer apply." }
-                    label { input type="checkbox" name="ack_stale"; " I understand; submit anyway" }
+                    label { input type="checkbox" name="ack_stale" checked[form.is_some_and(|f| f.ack_stale.is_some())]; " I understand; submit anyway" }
                 }
-                label { "Summary (top of the Review)" textarea name="summary" rows="4" {} }
+                label { "Summary (top of the Review)" textarea name="summary" rows="4" { (form.map_or("", |f| f.summary.as_str())) } }
                 label {
-                    input type="checkbox" name="approve" disabled[has_block];
+                    input type="checkbox" name="approve" checked[form.is_some_and(|f| f.approve.is_some())] disabled[has_block];
                     " Approve"
                     @if has_block { " (not available: something is Blocked)" }
                 }

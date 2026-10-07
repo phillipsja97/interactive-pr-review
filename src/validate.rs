@@ -89,6 +89,9 @@ fn check_fields(f: &Finding, p: &str, seen: &mut HashSet<String>, errors: &mut V
     }
     let required = [
         ("title", &f.title),
+        ("summary", &f.summary),
+        ("impact", &f.impact),
+        ("recommendation", &f.recommendation),
         ("draft_comment", &f.draft_comment),
         ("confidence/rationale", &f.confidence.rationale),
     ];
@@ -103,10 +106,16 @@ fn check_fields(f: &Finding, p: &str, seen: &mut HashSet<String>, errors: &mut V
         errors.push(err(format!("{p}/escalate_to"), "must be an @user or @org/team handle"));
     }
     for (j, ev) in f.evidence.iter().enumerate() {
-        if let Evidence::Diagram { mermaid, .. } = ev
-            && mermaid.trim().is_empty()
+        let blank = match ev {
+            Evidence::Diagram { mermaid, .. } => Some(("mermaid", mermaid)),
+            Evidence::Note { text } => Some(("text", text)),
+            Evidence::CommandOutput { command, .. } => Some(("command", command)),
+            Evidence::CodeExcerpt { .. } => None,
+        };
+        if let Some((field, value)) = blank
+            && value.trim().is_empty()
         {
-            errors.push(err(format!("{p}/evidence/{j}/mermaid"), "must not be empty"));
+            errors.push(err(format!("{p}/evidence/{j}/{field}"), "must not be empty"));
         }
     }
 }
@@ -309,5 +318,28 @@ mod tests {
         let errs = errors_for(FindingBatch { findings: vec![a, b] });
         assert_eq!(errs.len(), 2);
         assert!(errs[1].path.starts_with("/findings/1/"));
+    }
+
+    #[test]
+    fn all_prose_fields_must_not_be_blank() {
+        let mut f = base();
+        f.summary = " ".into();
+        f.impact = String::new();
+        f.recommendation = " ".into();
+        f.evidence = vec![
+            Evidence::Note { text: " ".into() },
+            Evidence::CommandOutput { command: String::new(), output: "x".into(), exit_code: None },
+        ];
+        let paths: Vec<String> = errors_for(one(f)).into_iter().map(|e| e.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "/findings/0/summary",
+                "/findings/0/impact",
+                "/findings/0/recommendation",
+                "/findings/0/evidence/0/text",
+                "/findings/0/evidence/1/command",
+            ]
+        );
     }
 }

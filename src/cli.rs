@@ -127,6 +127,11 @@ fn review(args: ReviewArgs) -> Result<i32> {
         }
     };
     let export_md = args.export_md.map(std::path::absolute).transpose()?;
+    if let Some(path) = &export_md
+        && !path.parent().is_some_and(|dir| dir.is_dir())
+    {
+        anyhow::bail!("--export-md: the directory for {} does not exist", path.display());
+    }
     let store = Store::from_env()?;
     let session = Session::new(
         repo.root().to_path_buf(),

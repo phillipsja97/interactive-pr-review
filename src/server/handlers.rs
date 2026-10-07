@@ -31,7 +31,7 @@ pub async fn finding_page(
     if idx >= s.entries.len() {
         return Err(SessionError::NoSuchFinding(idx).into());
     }
-    Ok(Html(pages::finding(&s, idx, None).into_string()))
+    Ok(Html(pages::finding(&s, idx, None, None).into_string()))
 }
 
 pub async fn asset(Path((_, name)): Path<(String, String)>) -> Response {
@@ -47,13 +47,13 @@ pub async fn asset(Path((_, name)): Path<(String, String)>) -> Response {
 #[derive(Deserialize)]
 pub struct RulingForm {
     #[serde(default)]
-    verdict: String,
+    pub verdict: String,
     #[serde(default)]
-    comment: String,
+    pub comment: String,
     #[serde(default)]
-    reason: String,
+    pub reason: String,
     #[serde(default)]
-    escalate_to: String,
+    pub escalate_to: String,
 }
 
 pub async fn save_ruling(
@@ -71,7 +71,7 @@ pub async fn save_ruling(
         Ok(Some(next)) => Ok(Redirect::to(&url(&token, &format!("f/{next}"))).into_response()),
         Ok(None) => Ok(Redirect::to(&url(&token, "submit")).into_response()),
         Err(AppError::Session(SessionError::Invalid(msg))) => {
-            let page = pages::finding(&st.snapshot(), idx, Some(&msg));
+            let page = pages::finding(&st.snapshot(), idx, Some(&msg), Some(&form));
             Ok((StatusCode::UNPROCESSABLE_ENTITY, Html(page.into_string())).into_response())
         }
         Err(e) => Err(e),
@@ -130,7 +130,7 @@ fn locate(st: &AppState, s: &Session, form: &NewFindingForm) -> Result<(Location
 
 pub async fn submit_page(State(st): State<AppState>) -> Html<String> {
     let s = st.snapshot();
-    Html(pages::submit(&s, preview(&st, &s).as_ref(), st.is_stale(), None).into_string())
+    Html(pages::submit(&s, preview(&st, &s).as_ref(), st.is_stale(), None, None).into_string())
 }
 
 /// The Review as it would be composed with no summary and no approval.
@@ -145,11 +145,11 @@ fn preview(st: &AppState, s: &Session) -> Option<ComposedReview> {
 #[derive(Deserialize)]
 pub struct SubmitForm {
     #[serde(default)]
-    summary: String,
+    pub summary: String,
     #[serde(default)]
-    approve: Option<String>,
+    pub approve: Option<String>,
     #[serde(default)]
-    ack_stale: Option<String>,
+    pub ack_stale: Option<String>,
 }
 
 pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) -> Result<Response, AppError> {
@@ -159,7 +159,7 @@ pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) ->
     }
     let stale = st.is_stale();
     let reject = |msg: &str| -> Response {
-        let page = pages::submit(&s, preview(&st, &s).as_ref(), stale, Some(msg));
+        let page = pages::submit(&s, preview(&st, &s).as_ref(), stale, Some(msg), Some(&form));
         (StatusCode::UNPROCESSABLE_ENTITY, Html(page.into_string())).into_response()
     };
     if stale && form.ack_stale.is_none() {
