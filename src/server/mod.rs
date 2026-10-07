@@ -10,7 +10,7 @@ use axum::extract::{Request, State};
 use axum::http::{header, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use tokio::sync::watch;
 
@@ -112,6 +112,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/s/{token}/", get(handlers::index))
         .route("/s/{token}/f/{idx}", get(handlers::finding_page))
+        .route("/s/{token}/f/{idx}/ruling", post(handlers::save_ruling))
+        .route("/s/{token}/new", get(handlers::new_page).post(handlers::create_reviewer_finding))
         .route("/s/{token}/assets/{name}", get(handlers::asset))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
@@ -284,5 +286,62 @@ mod tests {
         assert!(html.contains("main"));
         let plain = highlight::code_block("NOTES", "<b>", 1).into_string();
         assert!(plain.contains("&lt;b&gt;"), "{plain}");
+    }
+
+    #[tokio::test]
+    async fn rejects_cross_origin_posts() {
+        let fx = fixture();
+        let origin = |o| Some(("origin", o));
+        let form = Some("verdict=nit&comment=x");
+        let (s, _, _) = send(&fx.app, Method::POST, &fx.path("f/0/ruling"), form, HOST, origin("http://evil.example")).await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+        let (s, _, _) = send(&fx.app, Method::POST, &fx.path("f/0/ruling"), form, HOST, origin("http://127.0.0.1:4321")).await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn dismiss_without_reason_is_rejected_and_nothing_is_saved() {
+        let fx = fixture();
+        let (s, _, body) = fx.post("f/0/ruling", "verdict=dismiss&comment=&reason=").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("Dismiss needs a reason"));
+        assert!(fx.store.load(&fx.id).unwrap().entries[0].ruling.is_none());
+    }
+
+    #[tokio::test]
+    async fn ruling_saves_to_disk_and_moves_to_next_unruled() {
+        let fx = fixture();
+        let (s, h, _) = fx.post("f/0/ruling", "verdict=block&comment=Fix+it").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(location(&h), fx.path("f/1"));
+        let saved = fx.store.load(&fx.id).unwrap();
+        let r = saved.entries[0].ruling.as_ref().unwrap();
+        assert_eq!((&r.verdict, r.comment.as_str()), (&crate::session::Verdict::Block, "Fix it"));
+
+        let (_, h, _) = fx.post("f/1/ruling", "verdict=escalate&comment=Ask&escalate_to=%40sec").await;
+        assert_eq!(location(&h), fx.path("submit"));
+
+        let (_, _, page) = fx.get("f/1").await;
+        assert!(page.contains(r#"value="@sec""#), "the saved ruling pre-fills the form");
+    }
+
+    #[tokio::test]
+    async fn reviewer_can_add_a_finding() {
+        let fx = fixture();
+        let (s, h, _) = fx.post("new", "path=src%2Flib.rs&start=3&end=&comment=Rename+this").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(location(&h), fx.path("f/2"));
+        let saved = fx.store.load(&fx.id).unwrap();
+        assert_eq!(saved.entries[2].id, "reviewer-1");
+        assert_eq!(saved.entries[2].location_text.as_deref(), Some("line 3"));
+
+        let (s, _, body) = fx.post("new", "path=..%2Fetc&start=1&comment=Keep+me").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("repo-relative"));
+        assert!(body.contains("Keep me"), "typed values survive the error");
+
+        let (s, h, _) = fx.post("new", "path=&start=&comment=General+point").await;
+        assert_eq!(s, StatusCode::SEE_OTHER);
+        assert_eq!(location(&h), fx.path("f/3"));
     }
 }

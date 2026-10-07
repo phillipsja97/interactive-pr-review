@@ -3,9 +3,13 @@
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::Form;
+use serde::Deserialize;
 
 use super::{pages, url, AppError, AppState};
-use crate::session::SessionError;
+use crate::model::Location;
+use crate::session::{Ruling, Session, SessionError, Verdict};
+use crate::validate::{check_repo_path, resolve_lines};
 
 pub async fn index(State(st): State<AppState>) -> Redirect {
     let s = st.snapshot();
@@ -34,4 +38,88 @@ pub async fn asset(Path((_, name)): Path<(String, String)>) -> Response {
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     ([(header::CONTENT_TYPE, mime)], body).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct RulingForm {
+    #[serde(default)]
+    verdict: String,
+    #[serde(default)]
+    comment: String,
+    #[serde(default)]
+    reason: String,
+    #[serde(default)]
+    escalate_to: String,
+}
+
+pub async fn save_ruling(
+    State(st): State<AppState>,
+    Path((_, idx)): Path<(String, usize)>,
+    Form(form): Form<RulingForm>,
+) -> Result<Response, AppError> {
+    let token = st.token();
+    let saved = st.update(|s| {
+        let verdict = Verdict::from_form(&form.verdict, &form.reason, &form.escalate_to).map_err(SessionError::Invalid)?;
+        s.rule(idx, Ruling { verdict, comment: form.comment.trim().to_string() })?;
+        Ok(s.next_unruled_after(idx))
+    });
+    match saved {
+        Ok(Some(next)) => Ok(Redirect::to(&url(&token, &format!("f/{next}"))).into_response()),
+        Ok(None) => Ok(Redirect::to(&url(&token, "submit")).into_response()),
+        Err(AppError::Session(SessionError::Invalid(msg))) => {
+            let page = pages::finding(&st.snapshot(), idx, Some(&msg));
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, Html(page.into_string())).into_response())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Deserialize, Default)]
+pub struct NewFindingForm {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub start: String,
+    #[serde(default)]
+    pub end: String,
+    #[serde(default)]
+    pub comment: String,
+}
+
+pub async fn new_page(State(st): State<AppState>) -> Html<String> {
+    Html(pages::new_finding(&st.snapshot(), &NewFindingForm::default(), None).into_string())
+}
+
+pub async fn create_reviewer_finding(
+    State(st): State<AppState>,
+    Form(form): Form<NewFindingForm>,
+) -> Result<Response, AppError> {
+    let s = st.snapshot();
+    let created = locate(&st, &s, &form)
+        .map_err(|msg| AppError::Session(SessionError::Invalid(msg)))
+        .and_then(|(location, text)| st.update(|s| s.add_reviewer_finding(location, form.comment.clone(), text)));
+    match created {
+        Ok(idx) => Ok(Redirect::to(&url(&s.token, &format!("f/{idx}"))).into_response()),
+        Err(AppError::Session(SessionError::Invalid(msg))) => {
+            let page = pages::new_finding(&s, &form, Some(&msg));
+            Ok((StatusCode::UNPROCESSABLE_ENTITY, Html(page.into_string())).into_response())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The Reviewer's location: PR-wide when no path is given, otherwise checked against the head commit.
+fn locate(st: &AppState, s: &Session, form: &NewFindingForm) -> Result<(Location, Option<String>), String> {
+    let path = form.path.trim();
+    if path.is_empty() {
+        return Ok((Location::PrWide, None));
+    }
+    check_repo_path(path)?;
+    let start: u32 = form.start.trim().parse().map_err(|_| "Start line must be a number.".to_string())?;
+    let end: u32 = match form.end.trim() {
+        "" => start,
+        e => e.parse().map_err(|_| "End line must be a number.".to_string())?,
+    };
+    let text = resolve_lines(st.repo(), &s.head_sha, path, start, end).map_err(|e| e.message)?;
+    Ok((Location::Lines { path: path.to_string(), start, end }, Some(text)))
 }

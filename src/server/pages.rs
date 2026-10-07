@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use maud::{html, Markup, DOCTYPE};
 
+use super::handlers::NewFindingForm;
 use super::highlight::code_block;
 use super::url;
 use crate::model::{Evidence, Finding, Location};
@@ -189,4 +190,19 @@ pub fn done(message: &str) -> Markup {
             body style="font-family: system-ui, sans-serif; padding: 2rem" { p { (message) } }
         }
     }
+}
+
+pub fn new_finding(s: &Session, form: &NewFindingForm, error: Option<&str>) -> Markup {
+    let body = html! {
+        h1 { "Add your own finding" }
+        @if let Some(msg) = error { p.error { (msg) } }
+        form.new method="post" action=(url(&s.token, "new")) {
+            label { "File (leave empty for a PR-wide finding)" input type="text" name="path" value=(form.path) placeholder="src/main.rs"; }
+            label { "Start line" input type="text" name="start" value=(form.start) inputmode="numeric"; }
+            label { "End line (optional)" input type="text" name="end" value=(form.end) inputmode="numeric"; }
+            label { "Comment" textarea name="comment" rows="6" { (form.comment) } }
+            button type="submit" { "Add, then choose a verdict" }
+        }
+    };
+    layout(s, "Add your own finding", None, body)
 }
