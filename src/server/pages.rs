@@ -7,6 +7,7 @@ use maud::{html, Markup, DOCTYPE};
 use super::handlers::NewFindingForm;
 use super::highlight::code_block;
 use super::url;
+use crate::compose::ComposedReview;
 use crate::model::{Evidence, Finding, Location};
 use crate::session::{Origin, Session, Verdict};
 
@@ -205,4 +206,57 @@ pub fn new_finding(s: &Session, form: &NewFindingForm, error: Option<&str>) -> M
         }
     };
     layout(s, "Add your own finding", None, body)
+}
+
+pub fn submit(s: &Session, preview: Option<&ComposedReview>, stale: bool, error: Option<&str>) -> Markup {
+    let t = &s.token;
+    let unruled = s.unruled();
+    let has_block = s.entries.iter().any(|e| e.ruling.as_ref().is_some_and(|r| r.verdict == Verdict::Block));
+    let body = html! {
+        h1 { "Review & submit" }
+        @if let Some(msg) = error { p.error { (msg) } }
+        @if !s.is_open() {
+            p { "This session is closed." }
+        } @else if !unruled.is_empty() {
+            p { "Still needs a verdict:" }
+            ul {
+                @for i in &unruled {
+                    li { a href=(url(t, &format!("f/{i}"))) { (s.entries[*i].display_title()) } }
+                }
+            }
+        } @else {
+            form.submit method="post" action=(url(t, "submit")) {
+                @if stale {
+                    p.warning { "The change has new commits since these Findings were proposed; some may no longer apply." }
+                    label { input type="checkbox" name="ack_stale"; " I understand; submit anyway" }
+                }
+                label { "Summary (top of the Review)" textarea name="summary" rows="4" {} }
+                label {
+                    input type="checkbox" name="approve" disabled[has_block];
+                    " Approve"
+                    @if has_block { " (not available: something is Blocked)" }
+                }
+                p.hint { "If every Finding is dismissed: tick Approve to approve, write a summary to post a comment, or leave both empty to post nothing." }
+                @if let Some(path) = &s.export_md { p.hint { "The Review will be written to " code { (path.display()) } "." } }
+                button type="submit" { "Submit review" }
+            }
+            @if let Some(review) = preview {
+                section {
+                    h2 { "Preview" }
+                    p { "State: " strong { (review.state.map_or("Nothing to post", |st| st.label())) } " (your summary and Approve choice are applied on submit)" }
+                    @if !review.body.is_empty() { h3 { "Review body" } pre { (review.body) } }
+                    @for c in &review.inline {
+                        h3 { "Inline on " code { (location_label(&Location::Lines { path: c.path.clone(), start: c.start_line, end: c.line })) } }
+                        pre { (c.body) }
+                    }
+                }
+            }
+        }
+        @if s.is_open() {
+            form method="post" action=(url(t, "abandon")) {
+                button.secondary type="submit" { "Abandon session (post nothing)" }
+            }
+        }
+    };
+    layout(s, "Review & submit", None, body)
 }

@@ -114,6 +114,8 @@ pub fn router(state: AppState) -> Router {
         .route("/s/{token}/f/{idx}", get(handlers::finding_page))
         .route("/s/{token}/f/{idx}/ruling", post(handlers::save_ruling))
         .route("/s/{token}/new", get(handlers::new_page).post(handlers::create_reviewer_finding))
+        .route("/s/{token}/submit", get(handlers::submit_page).post(handlers::submit))
+        .route("/s/{token}/abandon", post(handlers::abandon))
         .route("/s/{token}/assets/{name}", get(handlers::asset))
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
@@ -147,6 +149,7 @@ mod tests {
     use crate::model::FindingBatch;
     use crate::session::{Store, Target};
     use crate::testutil::{sample_batch, sample_repo, TestRepo};
+    use crate::session::{ReviewState, SessionStatus};
     use crate::validate::validate;
     use axum::body::Body;
     use axum::http::{HeaderMap, Request as HttpRequest};
@@ -156,7 +159,6 @@ mod tests {
     pub(super) const PORT: u16 = 4321;
     pub(super) const HOST: &str = "127.0.0.1:4321";
 
-    #[allow(dead_code)] // TEMP: fields and helpers used by Task 7–8 tests; removed in Task 8
     pub(super) struct Fixture {
         pub repo: TestRepo,
         pub _state_dir: tempfile::TempDir,
@@ -190,7 +192,6 @@ mod tests {
         Fixture { app: router(state.clone()), repo, _state_dir: state_dir, store, state, token, id }
     }
 
-    #[allow(dead_code)] // TEMP: removed in Task 8
     impl Fixture {
         pub fn path(&self, rest: &str) -> String {
             url(&self.token, rest)
@@ -343,5 +344,93 @@ mod tests {
         let (s, h, _) = fx.post("new", "path=&start=&comment=General+point").await;
         assert_eq!(s, StatusCode::SEE_OTHER);
         assert_eq!(location(&h), fx.path("f/3"));
+    }
+
+    async fn rule_all(fx: &Fixture, first: &str) {
+        fx.post("f/0/ruling", &format!("verdict={first}&comment=First")).await;
+        fx.post("f/1/ruling", "verdict=nit&comment=Second").await;
+    }
+
+    #[tokio::test]
+    async fn submit_requires_every_verdict() {
+        let fx = fixture();
+        let (_, _, page) = fx.get("submit").await;
+        assert!(page.contains("Still needs a verdict"));
+        let (s, _, body) = fx.post("submit", "summary=").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("still need a Verdict"));
+    }
+
+    #[tokio::test]
+    async fn approve_is_refused_when_something_blocks() {
+        let fx = fixture();
+        rule_all(&fx, "block").await;
+        let (s, _, body) = fx.post("submit", "approve=on").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("Approve is not available"));
+    }
+
+    #[tokio::test]
+    async fn submit_finishes_the_session_and_writes_export() {
+        let out = tempfile::tempdir().unwrap();
+        let md = out.path().join("review.md");
+        let fx = fixture_with(Some(md.clone()), sample_batch());
+        rule_all(&fx, "block").await;
+        let (_, _, page) = fx.get("submit").await;
+        assert!(page.contains("Preview") && page.contains("Request changes"), "{page}");
+
+        let (s, _, body) = fx.post("submit", "summary=Thanks").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains("submitted"));
+        assert!(*fx.state.subscribe().borrow());
+        let saved = fx.store.load(&fx.id).unwrap();
+        assert_eq!(saved.status, SessionStatus::Submitted);
+        let outcome = saved.outcome.unwrap();
+        assert_eq!(outcome.state, Some(ReviewState::RequestChanges));
+        assert_eq!(outcome.summary, "Thanks");
+        assert_eq!(outcome.export_path, Some(md.clone()));
+        let text = std::fs::read_to_string(&md).unwrap();
+        assert!(text.starts_with("# Review: Request changes"), "{text}");
+        assert!(text.contains("**Blocking:** First"));
+
+        let (s, _, _) = fx.post("f/0/ruling", "verdict=nit&comment=late").await;
+        assert_eq!(s, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn stale_head_needs_acknowledgement() {
+        let fx = fixture();
+        rule_all(&fx, "comment").await;
+        fx.repo.write("src/other.rs", "new\n");
+        fx.repo.commit("more work");
+        let (_, _, page) = fx.get("submit").await;
+        assert!(page.contains("new commits"));
+        let (s, _, body) = fx.post("submit", "summary=").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("new commits"));
+        let (s, _, _) = fx.post("submit", "summary=&ack_stale=on").await;
+        assert_eq!(s, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn abandon_ends_the_session_without_an_outcome() {
+        let fx = fixture();
+        let (s, _, body) = fx.post("abandon", "").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(body.contains("abandoned"));
+        let saved = fx.store.load(&fx.id).unwrap();
+        assert_eq!(saved.status, SessionStatus::Abandoned);
+        assert!(saved.outcome.is_none());
+        assert!(*fx.state.subscribe().borrow());
+    }
+
+    #[tokio::test]
+    async fn empty_batch_goes_straight_to_submit() {
+        let fx = fixture_with(None, FindingBatch { findings: vec![] });
+        let (_, h, _) = fx.get("").await;
+        assert_eq!(location(&h), fx.path("submit"));
+        let (s, _, _) = fx.post("submit", "summary=").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(fx.store.load(&fx.id).unwrap().outcome.unwrap().state, None);
     }
 }

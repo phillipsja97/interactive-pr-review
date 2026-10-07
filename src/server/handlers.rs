@@ -10,6 +10,10 @@ use super::{pages, url, AppError, AppState};
 use crate::model::Location;
 use crate::session::{Ruling, Session, SessionError, Verdict};
 use crate::validate::{check_repo_path, resolve_lines};
+use anyhow::Context;
+
+use crate::compose::{cite_plain, compose, to_markdown, ComposedReview, SubmitChoice};
+use crate::session::{Outcome, SessionStatus};
 
 pub async fn index(State(st): State<AppState>) -> Redirect {
     let s = st.snapshot();
@@ -122,4 +126,76 @@ fn locate(st: &AppState, s: &Session, form: &NewFindingForm) -> Result<(Location
     };
     let text = resolve_lines(st.repo(), &s.head_sha, path, start, end).map_err(|e| e.message)?;
     Ok((Location::Lines { path: path.to_string(), start, end }, Some(text)))
+}
+
+pub async fn submit_page(State(st): State<AppState>) -> Html<String> {
+    let s = st.snapshot();
+    Html(pages::submit(&s, preview(&st, &s).as_ref(), st.is_stale(), None).into_string())
+}
+
+/// The Review as it would be composed with no summary and no approval.
+fn preview(st: &AppState, s: &Session) -> Option<ComposedReview> {
+    if !s.unruled().is_empty() {
+        return None;
+    }
+    let diff = st.repo().diff_map(&s.base_sha, &s.head_sha).ok()?;
+    compose(&s.entries, &diff, &SubmitChoice::default(), &cite_plain).ok()
+}
+
+#[derive(Deserialize)]
+pub struct SubmitForm {
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    approve: Option<String>,
+    #[serde(default)]
+    ack_stale: Option<String>,
+}
+
+pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) -> Result<Response, AppError> {
+    let s = st.snapshot();
+    if !s.is_open() {
+        return Err(SessionError::NotOpen.into());
+    }
+    let stale = st.is_stale();
+    let reject = |msg: &str| -> Response {
+        let page = pages::submit(&s, preview(&st, &s).as_ref(), stale, Some(msg));
+        (StatusCode::UNPROCESSABLE_ENTITY, Html(page.into_string())).into_response()
+    };
+    if stale && form.ack_stale.is_none() {
+        return Ok(reject("The change has new commits since these Findings were proposed. Tick the acknowledgement to submit anyway."));
+    }
+    let choice = SubmitChoice { approve: form.approve.is_some(), summary: form.summary.trim().to_string() };
+    let diff = st.repo().diff_map(&s.base_sha, &s.head_sha).map_err(AppError::Internal)?;
+    let review = match compose(&s.entries, &diff, &choice, &cite_plain) {
+        Ok(r) => r,
+        Err(e) => return Ok(reject(&e.to_string())),
+    };
+    if let Some(path) = &s.export_md {
+        std::fs::write(path, to_markdown(&review))
+            .with_context(|| format!("writing {}", path.display()))
+            .map_err(AppError::Internal)?;
+    }
+    st.update(|s| {
+        if !s.is_open() {
+            return Err(SessionError::NotOpen);
+        }
+        s.status = SessionStatus::Submitted;
+        s.outcome = Some(Outcome { state: review.state, summary: choice.summary.clone(), export_path: s.export_md.clone() });
+        Ok(())
+    })?;
+    st.finish();
+    Ok(Html(pages::done("Review submitted. You can close this tab.").into_string()).into_response())
+}
+
+pub async fn abandon(State(st): State<AppState>) -> Result<Html<String>, AppError> {
+    st.update(|s| {
+        if !s.is_open() {
+            return Err(SessionError::NotOpen);
+        }
+        s.status = SessionStatus::Abandoned;
+        Ok(())
+    })?;
+    st.finish();
+    Ok(Html(pages::done("Review abandoned. Nothing was posted. You can close this tab.").into_string()))
 }
