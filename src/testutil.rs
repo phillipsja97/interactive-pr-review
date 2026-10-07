@@ -85,3 +85,22 @@ pub fn finding(id: &str, severity: Severity, level: ConfidenceLevel) -> Finding 
         escalate_to: None,
     }
 }
+
+
+use crate::model::{Evidence, FindingBatch};
+
+/// Two findings against `sample_repo()`: a Minor one outside the diff and a Major one inside it.
+pub fn sample_batch() -> FindingBatch {
+    let mut minor = finding("minor", Severity::Minor, ConfidenceLevel::Medium);
+    minor.location = Location::Lines { path: "src/lib.rs".into(), start: 1, end: 2 };
+    let mut major = finding("major", Severity::Major, ConfidenceLevel::High);
+    major.title = "Retry loop never backs off".into();
+    major.location = Location::Lines { path: "src/lib.rs".into(), start: 10, end: 12 };
+    major.suggested_patch = Some("fixed 10\nfixed 11\nfixed 12".into());
+    major.evidence = vec![
+        Evidence::CodeExcerpt { path: "src/lib.rs".into(), start: 10, end: 12, git_ref: None, caption: Some("the loop".into()) },
+        Evidence::Diagram { mermaid: "graph TD; A-->B".into(), caption: None },
+        Evidence::CommandOutput { command: "cargo test".into(), output: "<script>alert(1)</script>".into(), exit_code: Some(101) },
+    ];
+    FindingBatch { findings: vec![minor, major] }
+}

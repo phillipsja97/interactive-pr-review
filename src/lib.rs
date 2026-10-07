@@ -4,3 +4,4 @@ pub mod git;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod session;
+pub mod validate;
