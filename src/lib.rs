@@ -5,3 +5,5 @@ pub mod git;
 pub(crate) mod testutil;
 pub mod session;
 pub mod validate;
+pub mod compose;
+pub mod result;
