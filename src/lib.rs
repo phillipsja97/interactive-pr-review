@@ -7,3 +7,4 @@ pub mod session;
 pub mod validate;
 pub mod compose;
 pub mod result;
+pub mod server;
