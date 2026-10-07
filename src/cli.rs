@@ -54,6 +54,8 @@ enum Command {
     },
     /// Print the JSON Schema of the findings file.
     Schema,
+    /// Print the agent-facing usage guide.
+    Guide,
 }
 
 #[derive(Args)]
@@ -92,6 +94,10 @@ pub fn run() -> i32 {
 fn dispatch(cli: Cli) -> Result<i32> {
     match cli.command {
         Command::Review(args) => review(args),
+        Command::Guide => {
+            print!("{}", crate::guide::guide());
+            Ok(exit::OK)
+        }
         Command::Wait { id, no_open } => wait(&id, no_open),
         Command::Sessions { open } => sessions(open),
         Command::Schema => {

@@ -232,3 +232,10 @@ fn wait_on_unknown_session_fails() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no session `nope`"));
 }
+
+#[test]
+fn guide_prints() {
+    let out = prr().arg("guide").output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("prr review --findings"));
+}
