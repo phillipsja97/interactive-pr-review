@@ -65,3 +65,23 @@ pub fn sample_repo() -> (TestRepo, String, String) {
     let head = t.commit("change");
     (t, base, head)
 }
+
+use crate::model::{Confidence, ConfidenceLevel, Finding, Location, Severity};
+
+/// A minimal valid PR-wide Finding.
+pub fn finding(id: &str, severity: Severity, level: ConfidenceLevel) -> Finding {
+    Finding {
+        id: id.into(),
+        title: format!("Title {id}"),
+        summary: "summary".into(),
+        location: Location::PrWide,
+        severity,
+        confidence: Confidence { level, rationale: "because".into() },
+        impact: "impact".into(),
+        recommendation: "recommendation".into(),
+        suggested_patch: None,
+        evidence: vec![],
+        draft_comment: format!("Comment on {id}"),
+        escalate_to: None,
+    }
+}
