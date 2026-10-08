@@ -114,8 +114,8 @@ pub fn pr_json(head: &str, base: &str, author: &str) -> serde_json::Value {
         "state": "open",
         "html_url": "https://github.com/o/r/pull/7",
         "user": { "login": author },
-        "head": { "sha": head },
-        "base": { "sha": base },
+        "head": { "sha": head, "ref": "feature" },
+        "base": { "sha": base, "ref": "main" },
     })
 }
 

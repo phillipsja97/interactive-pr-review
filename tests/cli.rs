@@ -271,7 +271,7 @@ fn rev(dir: &Path, r: &str) -> String {
 fn fake_gh(dir: &Path, head: &str, base: &str, author: &str, viewer: &str) -> String {
     let pr = serde_json::json!({
         "number": 7, "state": "open", "html_url": "https://github.com/o/r/pull/7",
-        "user": {"login": author}, "head": {"sha": head}, "base": {"sha": base},
+        "user": {"login": author}, "head": {"sha": head, "ref": "feature"}, "base": {"sha": base, "ref": "main"},
     });
     std::fs::write(dir.join("pr.json"), pr.to_string()).unwrap();
     std::fs::write(dir.join("viewer"), viewer).unwrap();
@@ -347,4 +347,16 @@ fn pr_and_base_are_exclusive() {
     assert_eq!(out.status.code(), Some(2), "clap rejects --base with --pr");
     let out = prr().current_dir(r.path()).args(["review", "--findings"]).arg(&f).arg("--pending").output().unwrap();
     assert_eq!(out.status.code(), Some(2), "--pending needs --pr");
+}
+
+#[test]
+fn missing_base_commit_says_to_fetch_the_base_branch() {
+    let (r, state) = (repo(), tempfile::tempdir().unwrap());
+    let gh = fake_gh(state.path(), &rev(r.path(), "feature"), &"0".repeat(40), "author", "me");
+    let f = findings_file(state.path(), "src/lib.rs");
+    let out = pr_review_cmd(r.path(), state.path(), &gh, &f, &[]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("base commit") && err.contains("`main`") && err.contains("git fetch"), "{err}");
+    assert!(!err.contains("gh pr checkout"), "checking out the PR does not fetch its base: {err}");
 }

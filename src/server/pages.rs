@@ -265,6 +265,12 @@ pub fn submit(
                     p.hint { "This is your own pull request. GitHub only accepts a comment review on it, so Blocks are posted as comments marked Blocking, and Approve is not available." }
                 }
                 p.hint { (destination) }
+                @if s.target.github_repo().is_some() {
+                    label {
+                        input type="checkbox" name="all_in_body" checked[form.is_some_and(|f| f.all_in_body.is_some())];
+                        " Post every comment in the review body (if GitHub rejects the inline comments)"
+                    }
+                }
                 p.hint { "If every Finding is dismissed: tick Approve to approve, write a summary to post a comment, or leave both empty to post nothing." }
                 @if let Some(path) = &s.export_md { p.hint { "The Review will be written to " code { (path.display()) } "." } }
                 button type="submit" { (button) }

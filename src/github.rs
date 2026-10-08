@@ -75,6 +75,8 @@ pub struct Gh {
 pub struct PullRequest {
     pub head_sha: String,
     pub base_sha: String,
+    /// The branch the PR merges into, e.g. `main`.
+    pub base_ref: String,
     pub author: String,
     /// `open` or `closed`.
     pub state: String,
@@ -96,6 +98,8 @@ struct Login {
 #[derive(Deserialize)]
 struct ShaJson {
     sha: String,
+    #[serde(default, rename = "ref")]
+    branch: String,
 }
 
 #[derive(Deserialize)]
@@ -130,7 +134,7 @@ impl Gh {
     pub fn pull(&self, dir: &Path, repo: &GithubRepo, number: u64) -> Result<PullRequest> {
         let path = format!("repos/{}/pulls/{number}", repo.name);
         let pr: PullJson = self.api(dir, repo, &[&path], None)?;
-        Ok(PullRequest { head_sha: pr.head.sha, base_sha: pr.base.sha, author: pr.user.login, state: pr.state })
+        Ok(PullRequest { head_sha: pr.head.sha, base_sha: pr.base.sha, base_ref: pr.base.branch, author: pr.user.login, state: pr.state })
     }
 
     /// The login `gh` is authenticated as.
@@ -212,7 +216,12 @@ pub fn review_payload(review: &ComposedReview, head_sha: &str, event: Option<&st
             comment
         })
         .collect();
-    let mut payload = json!({ "commit_id": head_sha, "body": review.body, "comments": comments });
+    // GitHub requires a body for REQUEST_CHANGES and COMMENT reviews.
+    let body = match event {
+        Some("REQUEST_CHANGES" | "COMMENT") if review.body.trim().is_empty() => "See the inline comments.",
+        _ => review.body.as_str(),
+    };
+    let mut payload = json!({ "commit_id": head_sha, "body": body, "comments": comments });
     if let Some(event) = event {
         payload["event"] = json!(event);
     }
@@ -319,7 +328,10 @@ mod tests {
         let dir = std::env::temp_dir();
         assert_eq!(gh.repo_of(&dir).unwrap(), gh_repo());
         let pr = gh.pull(&dir, &gh_repo(), 7).unwrap();
-        assert_eq!(pr, PullRequest { head_sha: "h".repeat(40), base_sha: "b".repeat(40), author: "author".into(), state: "open".into() });
+        assert_eq!(
+            pr,
+            PullRequest { head_sha: "h".repeat(40), base_sha: "b".repeat(40), base_ref: "main".into(), author: "author".into(), state: "open".into() }
+        );
         assert_eq!(gh.viewer(&dir, &gh_repo()).unwrap(), "me");
         assert_eq!(fake.calls(), "repo view --json url --jq .url\napi repos/o/r/pulls/7\napi user\n");
     }
@@ -354,5 +366,14 @@ mod tests {
     fn missing_gh_says_what_to_install() {
         let err = Gh::new("/nonexistent/gh", vec![]).repo_of(&std::env::temp_dir()).unwrap_err();
         assert!(format!("{err:#}").contains("GitHub CLI"), "{err:#}");
+    }
+
+    #[test]
+    fn empty_body_gets_a_default_when_github_requires_one() {
+        let review = ComposedReview { state: Some(ReviewState::RequestChanges), body: String::new(), inline: vec![] };
+        assert_eq!(review_payload(&review, "h", Some("REQUEST_CHANGES"))["body"], "See the inline comments.");
+        assert_eq!(review_payload(&review, "h", Some("COMMENT"))["body"], "See the inline comments.");
+        assert_eq!(review_payload(&review, "h", Some("APPROVE"))["body"], "");
+        assert_eq!(review_payload(&review, "h", None)["body"], "", "pending reviews are finished on GitHub");
     }
 }

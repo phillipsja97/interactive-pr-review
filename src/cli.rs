@@ -231,13 +231,21 @@ fn resolve_pr(repo: &Repo, spec: &str, pending: bool) -> Result<(Target, String,
     if pr.state != "open" {
         anyhow::bail!("{name} is {}; only open pull requests can be reviewed", pr.state);
     }
-    for sha in [&pr.head_sha, &pr.base_sha] {
-        if repo.rev_parse(sha).is_err() {
-            anyhow::bail!(
-                "commit {} of {name} is not in this clone; run `gh pr checkout {number}` (or `git fetch origin pull/{number}/head`) and retry",
-                &sha[..sha.len().min(12)]
-            );
-        }
+    let short = |sha: &str| sha[..sha.len().min(12)].to_string();
+    if repo.rev_parse(&pr.head_sha).is_err() {
+        anyhow::bail!(
+            "the head commit {} of {name} is not in this clone; run `gh pr checkout {number}` and retry",
+            short(&pr.head_sha)
+        );
+    }
+    if repo.rev_parse(&pr.base_sha).is_err() {
+        anyhow::bail!(
+            "the base commit {} of {name} is not in this clone; fetch the PR's base branch `{}` from {} (e.g. `git fetch <remote> {}`) and retry",
+            short(&pr.base_sha),
+            pr.base_ref,
+            gh_repo.name,
+            pr.base_ref
+        );
     }
     let base_sha = repo.merge_base(&pr.base_sha, &pr.head_sha)?;
     let own_pr = gh.viewer(repo.root(), &gh_repo)? == pr.author;

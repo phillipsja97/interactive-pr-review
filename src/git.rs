@@ -62,6 +62,10 @@ impl Repo {
                 "--no-ext-diff",
                 "--src-prefix=a/",
                 "--dst-prefix=b/",
+                // Match GitHub's PR diff regardless of diff.renames / diff.algorithm / diff.indentHeuristic config.
+                "--find-renames",
+                "--diff-algorithm=myers",
+                "--indent-heuristic",
                 "-U3",
                 base,
                 head,
@@ -284,5 +288,22 @@ deleted file mode 100644
         let map = t.repo().diff_map(&base, &head).unwrap();
         assert!(map.contains("quote\"d.rs", 2, 2));
         assert!(map.contains("back\\slash.rs", 2, 2));
+    }
+
+    #[test]
+    fn diff_map_detects_renames_whatever_the_user_config() {
+        let t = crate::testutil::TestRepo::new();
+        let lines: Vec<String> = (1..=10).map(|i| format!("line {i}")).collect();
+        t.write("old.rs", &(lines.join("\n") + "\n"));
+        let base = t.commit("base");
+        t.git(&["mv", "old.rs", "new.rs"]);
+        let mut changed = lines.clone();
+        changed[4] = "changed 5".into();
+        t.write("new.rs", &(changed.join("\n") + "\n"));
+        let head = t.commit("rename and change");
+        t.git(&["config", "diff.renames", "false"]);
+        let map = t.repo().diff_map(&base, &head).unwrap();
+        assert!(map.contains("new.rs", 5, 5));
+        assert!(!map.contains("new.rs", 1, 1), "unchanged lines of a renamed file are outside the diff, as on GitHub");
     }
 }

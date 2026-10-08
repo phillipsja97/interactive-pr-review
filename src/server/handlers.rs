@@ -11,6 +11,7 @@ use crate::model::Location;
 use crate::session::{Ruling, Session, SessionError, Verdict};
 use crate::validate::{check_repo_path, resolve_lines};
 
+use crate::git::DiffMap;
 use crate::compose::{cite_plain, compose, to_markdown, ComposedReview, SubmitChoice};
 use crate::github::{permalink, review_event, review_payload};
 use crate::session::{Outcome, SessionStatus, Target};
@@ -158,6 +159,9 @@ pub struct SubmitForm {
     pub approve: Option<String>,
     #[serde(default)]
     pub ack_stale: Option<String>,
+    /// Post every comment in the Review body, for when GitHub rejects inline placements.
+    #[serde(default)]
+    pub all_in_body: Option<String>,
 }
 
 pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) -> Result<Response, AppError> {
@@ -175,12 +179,16 @@ pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) ->
         return Ok(reject("The change has new commits since these Findings were proposed. Tick the acknowledgement to submit anyway."));
     }
     let choice = SubmitChoice { approve: form.approve.is_some(), summary: form.summary.trim().to_string() };
-    let diff = st.repo().diff_map(&s.base_sha, &s.head_sha).map_err(AppError::Internal)?;
+    let diff = if form.all_in_body.is_some() {
+        DiffMap::default()
+    } else {
+        st.repo().diff_map(&s.base_sha, &s.head_sha).map_err(AppError::Internal)?
+    };
     let gh = st.gh().clone();
     let root = st.repo().root().to_path_buf();
     // Compose, export, post and commit under the session lock, so a Verdict saved from another tab
     // can never slip in between composing the Review and recording it.
-    let committed = st.update(|s| {
+    let committed = st.update_keeping(|s| {
         if !s.is_open() {
             return Err(SessionError::NotOpen);
         }
@@ -208,12 +216,17 @@ pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) ->
         s.outcome = Some(Outcome { state: review.state, summary: choice.summary.clone(), export_path: s.export_md.clone(), posted });
         Ok(())
     });
-    match committed {
-        Ok(()) => {}
+    let save_error = match committed {
+        Ok(((), save_error)) => save_error,
         Err(AppError::Session(SessionError::Invalid(msg))) => return Ok(reject(&msg)),
         Err(e) => return Err(e),
-    }
+    };
     st.finish();
+    if let Some(e) = save_error {
+        let posted = st.snapshot().outcome.and_then(|o| o.posted).map(|p| format!(" It was posted: {}.", p.url)).unwrap_or_default();
+        let message = format!("The Review was submitted, but prr could not save the session: {e:#}.{posted} Do not submit it again.");
+        return Ok(Html(pages::done(&message).into_string()).into_response());
+    }
     Ok(Html(pages::done("Review submitted. You can close this tab.").into_string()).into_response())
 }
 

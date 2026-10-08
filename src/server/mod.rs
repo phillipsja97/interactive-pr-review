@@ -74,6 +74,21 @@ impl AppState {
         Ok(out)
     }
 
+    /// Like `update`, but keeps the change in memory even if saving it fails, because it records
+    /// something that already happened elsewhere (a Review posted to GitHub). The save error is returned
+    /// alongside the result instead.
+    pub fn update_keeping<T>(
+        &self,
+        f: impl FnOnce(&mut Session) -> Result<T, SessionError>,
+    ) -> Result<(T, Option<anyhow::Error>), AppError> {
+        let mut session = self.inner.session.lock().unwrap();
+        let mut draft = session.clone();
+        let out = f(&mut draft)?;
+        let save_error = self.inner.store.save(&draft).err();
+        *session = draft;
+        Ok((out, save_error))
+    }
+
     /// Whether the change has new commits since the session's Findings were proposed.
     pub fn is_stale(&self) -> bool {
         let s = self.snapshot();
@@ -611,5 +626,37 @@ mod tests {
         assert!(body.contains("Keep me"), "typed summary survives");
         assert!(fx.store.load(&fx.id).unwrap().is_open());
         assert!(!*fx.state.subscribe().borrow(), "the server keeps running");
+    }
+
+    #[tokio::test]
+    async fn rejected_inline_comments_can_be_moved_into_the_body() {
+        let (fx, fake, _) = github_fixture(false, false);
+        rule_all(&fx, "comment").await;
+        let (_, _, page) = fx.get("submit").await;
+        assert!(page.contains(r#"name="all_in_body""#), "{page}");
+        let (s, _, body) = fx.post("submit", "summary=&all_in_body=on").await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+        let p = fake.payload().unwrap();
+        assert_eq!(p["comments"].as_array().unwrap().len(), 0);
+        assert!(p["body"].as_str().unwrap().contains("Retry loop never backs off"), "{}", p["body"]);
+    }
+
+    #[tokio::test]
+    async fn a_posted_review_is_never_forgotten_when_saving_fails() {
+        let (fx, fake, _) = github_fixture(false, false);
+        rule_all(&fx, "comment").await;
+        // Saving renames a temp file over <id>.json; a directory in its place makes that fail.
+        let file = fx._state_dir.path().join(format!("sessions/{}.json", fx.id));
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        let (_, _, body) = fx.post("submit", "summary=").await;
+        assert!(fake.payload().is_some());
+        assert!(body.contains("https://github.com/o/r/pull/7#pullrequestreview-1"), "{body}");
+        let s = fx.state.snapshot();
+        assert_eq!(s.status, SessionStatus::Submitted);
+        assert!(s.outcome.unwrap().posted.is_some());
+        assert!(*fx.state.subscribe().borrow(), "the session ends, so the Agent gets the result");
+        let (again, _, _) = fx.post("submit", "summary=").await;
+        assert_eq!(again, StatusCode::CONFLICT, "no second post");
     }
 }
