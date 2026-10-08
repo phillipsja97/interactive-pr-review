@@ -1,10 +1,17 @@
 //! The GitHub adapter. prr reaches GitHub only through the `gh` CLI, reusing its authentication.
 
-use anyhow::{Context, Result};
+use std::ffi::OsString;
+use std::io::Write;
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::compose::{ComposedReview, cite_plain};
-use crate::session::ReviewState;
+use crate::session::{Posted, ReviewState};
 
 /// A GitHub repository: host plus `owner/name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +62,130 @@ impl PrRef {
         };
         from_url().context("--pr must be a pull request number or URL, e.g. 42 or https://github.com/owner/repo/pull/42")
     }
+}
+
+/// How prr runs the GitHub CLI. `PRR_GH` replaces the command (whitespace-separated), e.g. in tests.
+#[derive(Debug, Clone)]
+pub struct Gh {
+    program: OsString,
+    prefix: Vec<OsString>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub head_sha: String,
+    pub base_sha: String,
+    pub author: String,
+    /// `open` or `closed`.
+    pub state: String,
+}
+
+#[derive(Deserialize)]
+struct PullJson {
+    state: String,
+    user: Login,
+    head: ShaJson,
+    base: ShaJson,
+}
+
+#[derive(Deserialize)]
+struct Login {
+    login: String,
+}
+
+#[derive(Deserialize)]
+struct ShaJson {
+    sha: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewJson {
+    html_url: String,
+    state: String,
+}
+
+impl Gh {
+    pub fn new(program: impl Into<OsString>, prefix: Vec<OsString>) -> Gh {
+        Gh { program: program.into(), prefix }
+    }
+
+    pub fn from_env() -> Gh {
+        match std::env::var("PRR_GH") {
+            Ok(cmd) if !cmd.trim().is_empty() => {
+                let mut parts = cmd.split_whitespace().map(OsString::from);
+                let program = parts.next().unwrap_or_else(|| "gh".into());
+                Gh::new(program, parts.collect())
+            }
+            _ => Gh::new("gh", vec![]),
+        }
+    }
+
+    /// The GitHub repository of the clone at `dir`.
+    pub fn repo_of(&self, dir: &Path) -> Result<GithubRepo> {
+        let out = self.run(dir, &["repo", "view", "--json", "url", "--jq", ".url"], None)?;
+        let url = String::from_utf8_lossy(&out).trim().to_string();
+        GithubRepo::from_url(&url).with_context(|| format!("gh reported an unexpected repository URL `{url}`"))
+    }
+
+    pub fn pull(&self, dir: &Path, repo: &GithubRepo, number: u64) -> Result<PullRequest> {
+        let path = format!("repos/{}/pulls/{number}", repo.name);
+        let pr: PullJson = self.api(dir, repo, &[&path], None)?;
+        Ok(PullRequest { head_sha: pr.head.sha, base_sha: pr.base.sha, author: pr.user.login, state: pr.state })
+    }
+
+    /// The login `gh` is authenticated as.
+    pub fn viewer(&self, dir: &Path, repo: &GithubRepo) -> Result<String> {
+        Ok(self.api::<Login>(dir, repo, &["user"], None)?.login)
+    }
+
+    pub fn post_review(&self, dir: &Path, repo: &GithubRepo, number: u64, payload: &Value) -> Result<Posted> {
+        let path = format!("repos/{}/pulls/{number}/reviews", repo.name);
+        let body = serde_json::to_vec(payload)?;
+        let review: ReviewJson = self.api(dir, repo, &["--method", "POST", &path, "--input", "-"], Some(&body))?;
+        Ok(Posted { url: review.html_url, state: review.state })
+    }
+
+    fn api<T: DeserializeOwned>(&self, dir: &Path, repo: &GithubRepo, args: &[&str], stdin: Option<&[u8]>) -> Result<T> {
+        let mut full = vec!["api"];
+        if repo.host != "github.com" {
+            full.extend(["--hostname", repo.host.as_str()]);
+        }
+        full.extend_from_slice(args);
+        let out = self.run(dir, &full, stdin)?;
+        serde_json::from_slice(&out).with_context(|| format!("unexpected response from gh {}", full.join(" ")))
+    }
+
+    fn run(&self, dir: &Path, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>> {
+        let mut child = Command::new(&self.program)
+            .args(&self.prefix)
+            .args(args)
+            .current_dir(dir)
+            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!("could not run {}; is the GitHub CLI installed and on PATH? (https://cli.github.com)", self.program.to_string_lossy())
+            })?;
+        if let Some(input) = stdin {
+            child.stdin.take().expect("stdin is piped").write_all(input)?;
+        }
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!("gh {} failed: {}{}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim(), api_message(&out.stdout));
+        }
+        Ok(out.stdout)
+    }
+}
+
+/// GitHub's error message and details from an API error body, if any.
+fn api_message(stdout: &[u8]) -> String {
+    let Ok(body) = serde_json::from_slice::<Value>(stdout) else { return String::new() };
+    let mut parts: Vec<String> = body["message"].as_str().map(String::from).into_iter().collect();
+    if let Some(errors) = body["errors"].as_array() {
+        parts.extend(errors.iter().filter_map(|e| e.as_str().or_else(|| e["message"].as_str())).map(String::from));
+    }
+    if parts.is_empty() { String::new() } else { format!(" ({})", parts.join("; ")) }
 }
 
 /// GitHub's review event for a Review state. GitHub refuses REQUEST_CHANGES and APPROVE on
@@ -177,5 +308,51 @@ mod tests {
             permalink(&gh_repo(), "abc", "my dir/a#b.rs", 5, 5),
             "[`my dir/a#b.rs:5`](https://github.com/o/r/blob/abc/my%20dir/a%23b.rs#L5)"
         );
+    }
+
+    use crate::testutil::FakeGh;
+
+    #[test]
+    fn gh_reads_the_repo_pr_and_viewer() {
+        let fake = FakeGh::new("h".repeat(40).as_str(), "b".repeat(40).as_str(), "author", "me");
+        let gh = fake.gh();
+        let dir = std::env::temp_dir();
+        assert_eq!(gh.repo_of(&dir).unwrap(), gh_repo());
+        let pr = gh.pull(&dir, &gh_repo(), 7).unwrap();
+        assert_eq!(pr, PullRequest { head_sha: "h".repeat(40), base_sha: "b".repeat(40), author: "author".into(), state: "open".into() });
+        assert_eq!(gh.viewer(&dir, &gh_repo()).unwrap(), "me");
+        assert_eq!(fake.calls(), "repo view --json url --jq .url\napi repos/o/r/pulls/7\napi user\n");
+    }
+
+    #[test]
+    fn gh_posts_the_payload() {
+        let fake = FakeGh::new("h", "b", "author", "me");
+        let posted = fake.gh().post_review(&std::env::temp_dir(), &gh_repo(), 7, &serde_json::json!({"body": "hi"})).unwrap();
+        assert_eq!(posted.url, "https://github.com/o/r/pull/7#pullrequestreview-1");
+        assert_eq!(posted.state, "COMMENTED");
+        assert_eq!(fake.payload().unwrap(), serde_json::json!({"body": "hi"}));
+        assert!(fake.calls().contains("api --method POST repos/o/r/pulls/7/reviews --input -"));
+    }
+
+    #[test]
+    fn gh_names_non_github_hosts() {
+        let fake = FakeGh::new("h", "b", "author", "me");
+        let ghe = GithubRepo { host: "ghe.example.com".into(), name: "o/r".into() };
+        fake.gh().pull(&std::env::temp_dir(), &ghe, 7).unwrap();
+        assert!(fake.calls().contains("api --hostname ghe.example.com repos/o/r/pulls/7"), "{}", fake.calls());
+    }
+
+    #[test]
+    fn gh_failures_carry_its_message() {
+        let fake = FakeGh::new("h", "b", "author", "me");
+        fake.fail_reviews("gh: Validation Failed (HTTP 422)");
+        let err = fake.gh().post_review(&std::env::temp_dir(), &gh_repo(), 7, &serde_json::json!({})).unwrap_err();
+        assert!(format!("{err:#}").contains("Validation Failed (HTTP 422)"), "{err:#}");
+    }
+
+    #[test]
+    fn missing_gh_says_what_to_install() {
+        let err = Gh::new("/nonexistent/gh", vec![]).repo_of(&std::env::temp_dir()).unwrap_err();
+        assert!(format!("{err:#}").contains("GitHub CLI"), "{err:#}");
     }
 }

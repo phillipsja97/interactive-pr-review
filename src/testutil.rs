@@ -104,3 +104,54 @@ pub fn sample_batch() -> FindingBatch {
     ];
     FindingBatch { findings: vec![minor, major] }
 }
+
+use crate::github::Gh;
+
+/// The JSON `gh api repos/o/r/pulls/7` would return, trimmed to what prr reads.
+pub fn pr_json(head: &str, base: &str, author: &str) -> serde_json::Value {
+    serde_json::json!({
+        "number": 7,
+        "state": "open",
+        "html_url": "https://github.com/o/r/pull/7",
+        "user": { "login": author },
+        "head": { "sha": head },
+        "base": { "sha": base },
+    })
+}
+
+/// A fake `gh` (tests/fixtures/fake-gh.sh) run via `sh`, answering from files in its own directory.
+pub struct FakeGh {
+    dir: tempfile::TempDir,
+}
+
+impl FakeGh {
+    pub fn new(head: &str, base: &str, author: &str, viewer: &str) -> FakeGh {
+        let fake = FakeGh { dir: tempfile::tempdir().unwrap() };
+        fs::write(fake.dir.path().join("gh.sh"), include_str!("../tests/fixtures/fake-gh.sh")).unwrap();
+        fs::write(fake.dir.path().join("viewer"), viewer).unwrap();
+        fake.set_pr(head, base, author);
+        fake
+    }
+
+    pub fn gh(&self) -> Gh {
+        Gh::new("sh", vec![self.dir.path().join("gh.sh").into()])
+    }
+
+    pub fn set_pr(&self, head: &str, base: &str, author: &str) {
+        fs::write(self.dir.path().join("pr.json"), pr_json(head, base, author).to_string()).unwrap();
+    }
+
+    /// Makes the next review POST fail with `stderr`.
+    pub fn fail_reviews(&self, stderr: &str) {
+        fs::write(self.dir.path().join("fail"), stderr).unwrap();
+    }
+
+    pub fn payload(&self) -> Option<serde_json::Value> {
+        let text = fs::read_to_string(self.dir.path().join("payload.json")).ok()?;
+        Some(serde_json::from_str(&text).unwrap())
+    }
+
+    pub fn calls(&self) -> String {
+        fs::read_to_string(self.dir.path().join("calls.log")).unwrap_or_default()
+    }
+}
