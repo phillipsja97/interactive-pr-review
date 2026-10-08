@@ -75,7 +75,10 @@ fn format_comment(entry: &Entry, verdict: &Verdict, comment: &str, inline: bool)
         Verdict::Comment | Verdict::Dismiss { .. } => comment.to_string(),
     };
     if inline && let Some(patch) = entry.finding().and_then(|f| f.suggested_patch.as_ref()) {
-        text.push_str(&format!("\n\n```suggestion\n{patch}\n```"));
+        // The fence must be longer than any backtick run inside the patch, or the patch would close it.
+        let longest = patch.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(longest.max(2) + 1);
+        text.push_str(&format!("\n\n{fence}suggestion\n{patch}\n{fence}"));
     }
     text
 }
@@ -271,5 +274,15 @@ mod tests {
         assert!(md.contains("### Nits"));
         assert!(md.contains("## Inline comments\n\n### `src/lib.rs:10`\n\nInline one\n"), "{md}");
         assert_eq!(to_markdown(&ComposedReview { state: None, body: String::new(), inline: vec![] }), "# Review: Nothing to post\n");
+    }
+
+    #[test]
+    fn suggestion_fence_outlasts_backticks_in_the_patch() {
+        let mut e = ruled("in", at(10, 10), Verdict::Comment, "Doc fix");
+        if let Proposal::Agent(f) = &mut e.proposal {
+            f.suggested_patch = Some("/// ```\n/// let x = 1;\n/// ```".into());
+        }
+        let r = compose(&[e], &diff(), &choice(false, ""), &cite_plain).unwrap();
+        assert_eq!(r.inline[0].body, "Doc fix\n\n````suggestion\n/// ```\n/// let x = 1;\n/// ```\n````");
     }
 }

@@ -10,7 +10,6 @@ use super::{pages, url, AppError, AppState};
 use crate::model::Location;
 use crate::session::{Ruling, Session, SessionError, Verdict};
 use crate::validate::{check_repo_path, resolve_lines};
-use anyhow::Context;
 
 use crate::compose::{cite_plain, compose, to_markdown, ComposedReview, SubmitChoice};
 use crate::session::{Outcome, SessionStatus};
@@ -159,6 +158,7 @@ pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) ->
     }
     let stale = st.is_stale();
     let reject = |msg: &str| -> Response {
+        let s = st.snapshot();
         let page = pages::submit(&s, preview(&st, &s).as_ref(), stale, Some(msg), Some(&form));
         (StatusCode::UNPROCESSABLE_ENTITY, Html(page.into_string())).into_response()
     };
@@ -167,23 +167,26 @@ pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) ->
     }
     let choice = SubmitChoice { approve: form.approve.is_some(), summary: form.summary.trim().to_string() };
     let diff = st.repo().diff_map(&s.base_sha, &s.head_sha).map_err(AppError::Internal)?;
-    let review = match compose(&s.entries, &diff, &choice, &cite_plain) {
-        Ok(r) => r,
-        Err(e) => return Ok(reject(&e.to_string())),
-    };
-    if let Some(path) = &s.export_md {
-        std::fs::write(path, to_markdown(&review))
-            .with_context(|| format!("writing {}", path.display()))
-            .map_err(AppError::Internal)?;
-    }
-    st.update(|s| {
+    // Compose, export and commit under the session lock, so a Verdict saved from another tab
+    // can never slip in between composing the Review and recording it.
+    let committed = st.update(|s| {
         if !s.is_open() {
             return Err(SessionError::NotOpen);
+        }
+        let review = compose(&s.entries, &diff, &choice, &cite_plain).map_err(|e| SessionError::Invalid(e.to_string()))?;
+        if let Some(path) = &s.export_md {
+            std::fs::write(path, to_markdown(&review))
+                .map_err(|e| SessionError::Invalid(format!("Could not write the Review to {}: {e}", path.display())))?;
         }
         s.status = SessionStatus::Submitted;
         s.outcome = Some(Outcome { state: review.state, summary: choice.summary.clone(), export_path: s.export_md.clone() });
         Ok(())
-    })?;
+    });
+    match committed {
+        Ok(()) => {}
+        Err(AppError::Session(SessionError::Invalid(msg))) => return Ok(reject(&msg)),
+        Err(e) => return Err(e),
+    }
     st.finish();
     Ok(Html(pages::done("Review submitted. You can close this tab.").into_string()).into_response())
 }

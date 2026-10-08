@@ -409,6 +409,20 @@ impl Store {
         Ok(self.list()?.into_iter().find(|s| s.is_open() && s.same_change(like)))
     }
 
+    /// Marks a session Abandoned if it is still open; errors if another process is serving it.
+    /// Reads the session under its lock, so a session that finished meanwhile is never overwritten.
+    pub fn abandon_open(&self, id: &str) -> Result<()> {
+        let _lock = self
+            .try_lock(id)?
+            .with_context(|| format!("session {id} is being served by another prr process; finish it there first"))?;
+        let mut session = self.load(id)?;
+        if !session.is_open() {
+            return Ok(());
+        }
+        session.status = SessionStatus::Abandoned;
+        self.save(&session)
+    }
+
     /// An exclusive lock marking the session as served by this process; `None` if another process holds it.
     /// The lock is released when the returned file is dropped or the process exits.
     pub fn try_lock(&self, id: &str) -> Result<Option<File>> {
@@ -577,5 +591,29 @@ mod tests {
         assert_eq!(mode(dir.path().join("sessions")), 0o700);
         assert_eq!(mode(dir.path().join(format!("sessions/{}.json", s.id))), 0o600);
         assert_eq!(mode(dir.path().join(format!("sessions/{}.lock", s.id))), 0o600);
+    }
+
+    #[test]
+    fn abandon_open_never_overwrites_a_finished_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf());
+
+        let mut done = session(vec![]);
+        done.status = SessionStatus::Submitted;
+        done.outcome = Some(Outcome { state: Some(ReviewState::Comment), summary: "hi".into(), export_path: None });
+        store.save(&done).unwrap();
+        store.abandon_open(&done.id).unwrap();
+        assert_eq!(store.load(&done.id).unwrap(), done, "a submitted session is left alone");
+
+        let open = session(vec![]);
+        store.save(&open).unwrap();
+        store.abandon_open(&open.id).unwrap();
+        assert_eq!(store.load(&open.id).unwrap().status, SessionStatus::Abandoned);
+
+        let served = session(vec![]);
+        store.save(&served).unwrap();
+        let _held = store.try_lock(&served.id).unwrap();
+        assert!(store.abandon_open(&served.id).is_err(), "a session served elsewhere is not touched");
+        assert!(store.load(&served.id).unwrap().is_open());
     }
 }

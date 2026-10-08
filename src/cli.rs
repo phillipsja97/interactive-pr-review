@@ -141,7 +141,7 @@ fn review(args: ReviewArgs) -> Result<i32> {
         entries,
         export_md,
     );
-    if let Some(mut existing) = store.find_open(&session)? {
+    if let Some(existing) = store.find_open(&session)? {
         if !args.replace {
             eprintln!(
                 "prr: session {id} is already open for this change; resume it with `prr wait {id}` or pass --replace",
@@ -149,11 +149,7 @@ fn review(args: ReviewArgs) -> Result<i32> {
             );
             return Ok(exit::SESSION_EXISTS);
         }
-        let _old_lock = store
-            .try_lock(&existing.id)?
-            .with_context(|| format!("session {} is being served by another prr process; finish it there first", existing.id))?;
-        existing.status = SessionStatus::Abandoned;
-        store.save(&existing)?;
+        store.abandon_open(&existing.id)?;
     }
     store.save(&session)?;
     let _lock = store.try_lock(&session.id)?.context("could not lock the new session")?;

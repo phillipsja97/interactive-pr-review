@@ -1,5 +1,6 @@
 //! Read-only access to the repository via the `git` CLI.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,7 +50,8 @@ impl Repo {
     }
 
     pub fn diff_map(&self, base: &str, head: &str) -> Result<DiffMap> {
-        let diff = run_git(
+        // Lossy: diffs carry raw file bytes, and only the ASCII header and hunk lines matter here.
+        let diff = run_git_bytes(
             &self.root,
             // Explicit prefixes override diff.noprefix / diff.dstPrefix in the user's config.
             &[
@@ -65,7 +67,7 @@ impl Repo {
                 head,
             ],
         )?;
-        Ok(DiffMap::parse(&diff))
+        Ok(DiffMap::parse(&String::from_utf8_lossy(&diff)))
     }
 
     fn git(&self) -> Command {
@@ -76,11 +78,15 @@ impl Repo {
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
+    String::from_utf8(run_git_bytes(dir, args)?).context("git output was not UTF-8")
+}
+
+fn run_git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let out = Command::new("git").arg("-C").arg(dir).args(args).output().context("failed to run git")?;
     if !out.status.success() {
         bail!("git {} failed: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
-    String::from_utf8(out.stdout).context("git output was not UTF-8")
+    Ok(out.stdout)
 }
 
 /// Head-side line ranges covered by each file's diff hunks — the lines a Code host accepts inline comments on.
@@ -101,7 +107,7 @@ impl DiffMap {
             } else if let Some(target) = line.strip_prefix("+++ ").filter(|_| in_header) {
                 // git appends a tab after paths that contain spaces.
                 let target = unquote(target.strip_suffix('\t').unwrap_or(target));
-                path = (target != "/dev/null").then(|| target.strip_prefix("b/").unwrap_or(target).to_string());
+                path = (target != "/dev/null").then(|| target.strip_prefix("b/").unwrap_or(&target).to_string());
             } else if line.starts_with("@@ ") {
                 in_header = false;
                 if let (Some(p), Some((start, len))) = (&path, parse_new_range(line))
@@ -128,8 +134,43 @@ fn parse_new_range(header: &str) -> Option<(u32, u32)> {
     }
 }
 
-fn unquote(s: &str) -> &str {
-    s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s)
+/// Decodes a path git wrote as a C-style quoted string (`"b/a\"b.rs"`); other paths are returned as-is.
+fn unquote(s: &str) -> Cow<'_, str> {
+    let Some(inner) = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else { return Cow::Borrowed(s) };
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut chars = inner.bytes().peekable();
+    while let Some(b) = chars.next() {
+        if b != b'\\' {
+            bytes.push(b);
+            continue;
+        }
+        match chars.next() {
+            Some(b'n') => bytes.push(b'\n'),
+            Some(b't') => bytes.push(b'\t'),
+            Some(b'r') => bytes.push(b'\r'),
+            Some(b'a') => bytes.push(0x07),
+            Some(b'b') => bytes.push(0x08),
+            Some(b'f') => bytes.push(0x0c),
+            Some(b'v') => bytes.push(0x0b),
+            Some(d @ b'0'..=b'7') => {
+                // Octal escape: up to three digits, one byte.
+                let mut value = u32::from(d - b'0');
+                for _ in 0..2 {
+                    match chars.peek() {
+                        Some(&n @ b'0'..=b'7') => {
+                            value = value * 8 + u32::from(n - b'0');
+                            chars.next();
+                        }
+                        _ => break,
+                    }
+                }
+                bytes.push(value as u8);
+            }
+            Some(other) => bytes.push(other),
+            None => bytes.push(b'\\'),
+        }
+    }
+    Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]
@@ -213,5 +254,35 @@ deleted file mode 100644
             assert!(map.contains("b/inner.rs", 2, 2), "{key}");
             t.git(&["config", "--unset", key]);
         }
+    }
+
+    #[test]
+    fn diff_map_tolerates_non_utf8_content() {
+        let t = crate::testutil::TestRepo::new();
+        std::fs::write(t.path().join("latin.txt"), b"caf\xe9\nb\n").unwrap();
+        let base = t.commit("base");
+        std::fs::write(t.path().join("latin.txt"), b"caf\xe9\nB\n").unwrap();
+        let head = t.commit("change");
+        let map = t.repo().diff_map(&base, &head).unwrap();
+        assert!(map.contains("latin.txt", 2, 2));
+    }
+
+    #[test]
+    fn diff_map_decodes_c_quoted_paths() {
+        let map = DiffMap::parse(
+            "diff --git \"a/a\\\"b.rs\" \"b/a\\\"b.rs\"\n--- \"a/a\\\"b.rs\"\n+++ \"b/a\\\"b.rs\"\n@@ -1 +1 @@\n-x\n+y\n",
+        );
+        assert!(map.contains("a\"b.rs", 1, 1));
+
+        let t = crate::testutil::TestRepo::new();
+        t.write("quote\"d.rs", "a\nb\n");
+        t.write("back\\slash.rs", "a\nb\n");
+        let base = t.commit("base");
+        t.write("quote\"d.rs", "a\nB\n");
+        t.write("back\\slash.rs", "a\nB\n");
+        let head = t.commit("change");
+        let map = t.repo().diff_map(&base, &head).unwrap();
+        assert!(map.contains("quote\"d.rs", 2, 2));
+        assert!(map.contains("back\\slash.rs", 2, 2));
     }
 }

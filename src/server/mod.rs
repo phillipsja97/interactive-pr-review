@@ -488,4 +488,17 @@ mod tests {
         assert!(body.contains("Keep this"), "{body}");
         assert!(body.contains(r#"name="approve" checked"#), "{body}");
     }
+
+    #[tokio::test]
+    async fn export_failure_keeps_the_session_open_and_explains() {
+        let out = tempfile::tempdir().unwrap();
+        let fx = fixture_with(Some(out.path().join("missing/review.md")), sample_batch());
+        rule_all(&fx, "comment").await;
+        let (s, _, body) = fx.post("submit", "summary=Keep+me").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("Could not write"), "{body}");
+        assert!(body.contains("Keep me"), "typed summary survives");
+        assert!(fx.store.load(&fx.id).unwrap().is_open());
+        assert!(!*fx.state.subscribe().borrow(), "the server keeps running");
+    }
 }
