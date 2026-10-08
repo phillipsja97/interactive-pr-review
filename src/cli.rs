@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
 use crate::git::Repo;
+use crate::github::{Gh, PrRef};
 use crate::model::FindingBatch;
 use crate::result::ReviewResult;
 use crate::server::{self, ServeEnd};
@@ -63,12 +64,19 @@ struct ReviewArgs {
     /// Findings JSON file, or `-` for stdin.
     #[arg(long)]
     findings: PathBuf,
-    /// Base of the change, e.g. `main`.
-    #[arg(long)]
-    base: String,
-    /// Head of the change.
-    #[arg(long, default_value = "HEAD")]
+    /// Base of the change, e.g. `main` (local mode; not with --pr).
+    #[arg(long, required_unless_present = "pr", conflicts_with = "pr")]
+    base: Option<String>,
+    /// Head of the change (local mode; not with --pr).
+    #[arg(long, default_value = "HEAD", conflicts_with = "pr")]
     head: String,
+    /// Review a GitHub pull request: its number in this clone's GitHub repository, or its URL.
+    /// Needs the GitHub CLI (`gh`), authenticated, and the PR's commits in this clone.
+    #[arg(long)]
+    pr: Option<String>,
+    /// With --pr: create a pending review that the Reviewer finishes on GitHub.
+    #[arg(long, requires = "pr")]
+    pending: bool,
     /// Print the URL instead of opening a browser.
     #[arg(long)]
     no_open: bool,
@@ -110,8 +118,15 @@ fn dispatch(cli: Cli) -> Result<i32> {
 
 fn review(args: ReviewArgs) -> Result<i32> {
     let repo = Repo::discover(&std::env::current_dir()?)?;
-    let head_sha = repo.rev_parse(&args.head)?;
-    let base_sha = repo.merge_base(&repo.rev_parse(&args.base)?, &head_sha)?;
+    let (target, base_sha, head_sha) = match &args.pr {
+        Some(spec) => resolve_pr(&repo, spec, args.pending)?,
+        None => {
+            let base = args.base.clone().context("--base is required without --pr")?;
+            let head_sha = repo.rev_parse(&args.head)?;
+            let base_sha = repo.merge_base(&repo.rev_parse(&base)?, &head_sha)?;
+            (Target::Local { base_ref: base, head_ref: args.head.clone() }, base_sha, head_sha)
+        }
+    };
     let json = if args.findings.as_os_str() == "-" {
         let mut s = String::new();
         std::io::stdin().read_to_string(&mut s)?;
@@ -135,7 +150,7 @@ fn review(args: ReviewArgs) -> Result<i32> {
     let store = Store::from_env()?;
     let session = Session::new(
         repo.root().to_path_buf(),
-        Target::Local { base_ref: args.base, head_ref: args.head },
+        target,
         base_sha,
         head_sha,
         entries,
@@ -202,10 +217,38 @@ fn sessions(open_only: bool) -> Result<i32> {
     Ok(exit::OK)
 }
 
+/// Looks the pull request up on GitHub and checks its commits are in this clone.
+fn resolve_pr(repo: &Repo, spec: &str, pending: bool) -> Result<(Target, String, String)> {
+    let gh = Gh::from_env();
+    let pr_ref = PrRef::parse(spec)?;
+    let gh_repo = match pr_ref.repo {
+        Some(r) => r,
+        None => gh.repo_of(repo.root())?,
+    };
+    let number = pr_ref.number;
+    let name = format!("{}#{number}", gh_repo.name);
+    let pr = gh.pull(repo.root(), &gh_repo, number)?;
+    if pr.state != "open" {
+        anyhow::bail!("{name} is {}; only open pull requests can be reviewed", pr.state);
+    }
+    for sha in [&pr.head_sha, &pr.base_sha] {
+        if repo.rev_parse(sha).is_err() {
+            anyhow::bail!(
+                "commit {} of {name} is not in this clone; run `gh pr checkout {number}` (or `git fetch origin pull/{number}/head`) and retry",
+                &sha[..sha.len().min(12)]
+            );
+        }
+    }
+    let base_sha = repo.merge_base(&pr.base_sha, &pr.head_sha)?;
+    let own_pr = gh.viewer(repo.root(), &gh_repo)? == pr.author;
+    let target = Target::Github { host: gh_repo.host, repo: gh_repo.name, number, own_pr, pending };
+    Ok((target, base_sha, pr.head_sha))
+}
+
 /// Serves the session until it ends, then prints the result and returns the exit code.
 pub(crate) fn run_server(session: Session, store: Store, repo: Repo, open_browser: bool) -> Result<i32> {
     let runtime = tokio::runtime::Runtime::new()?;
-    match runtime.block_on(server::serve_session(session, store, repo, crate::github::Gh::from_env(), open_browser))? {
+    match runtime.block_on(server::serve_session(session, store, repo, Gh::from_env(), open_browser))? {
         ServeEnd::Interrupted(s) => {
             eprintln!("prr: interrupted; session {id} is still open — resume with `prr wait {id}`", id = s.id);
             Ok(exit::INTERRUPTED)

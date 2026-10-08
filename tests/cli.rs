@@ -261,3 +261,90 @@ fn bad_export_path_fails_before_opening_a_session() {
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("--export-md"));
 }
+
+fn rev(dir: &Path, r: &str) -> String {
+    let out = Command::new("git").arg("-C").arg(dir).args(["rev-parse", r]).output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Writes the fake gh next to `pr.json`/`viewer` in `dir` and returns the PRR_GH command for it.
+fn fake_gh(dir: &Path, head: &str, base: &str, author: &str, viewer: &str) -> String {
+    let pr = serde_json::json!({
+        "number": 7, "state": "open", "html_url": "https://github.com/o/r/pull/7",
+        "user": {"login": author}, "head": {"sha": head}, "base": {"sha": base},
+    });
+    std::fs::write(dir.join("pr.json"), pr.to_string()).unwrap();
+    std::fs::write(dir.join("viewer"), viewer).unwrap();
+    std::fs::write(dir.join("gh.sh"), include_str!("fixtures/fake-gh.sh")).unwrap();
+    format!("sh {}", dir.join("gh.sh").display())
+}
+
+fn pr_review_cmd(repo: &Path, state: &Path, gh: &str, findings: &Path, extra: &[&str]) -> Command {
+    let mut c = prr();
+    c.current_dir(repo)
+        .env("PRR_STATE_DIR", state)
+        .env("PRR_GH", gh)
+        .args(["review", "--findings"])
+        .arg(findings)
+        .args(["--pr", "7", "--no-open"])
+        .args(extra);
+    c
+}
+
+#[test]
+fn github_review_posts_on_submit() {
+    let (r, state) = (repo(), tempfile::tempdir().unwrap());
+    let head = rev(r.path(), "feature");
+    let gh = fake_gh(state.path(), &head, &rev(r.path(), "main"), "author", "me");
+    let f = findings_file(state.path(), "src/lib.rs");
+    let run = start(&mut pr_review_cmd(r.path(), state.path(), &gh, &f, &[]));
+    post(&format!("{}f/0/ruling", run.url), &[("verdict", "block"), ("comment", "Please revert")]);
+    post(&format!("{}submit", run.url), &[("summary", "Thanks")]);
+
+    let (code, result) = result_of(run.child);
+    assert_eq!(code, 0);
+    assert_eq!(result["posted"], true);
+    assert_eq!(result["posted_url"], "https://github.com/o/r/pull/7#pullrequestreview-1");
+    assert_eq!(result["posted_state"], "COMMENTED");
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state.path().join("payload.json")).unwrap()).unwrap();
+    assert_eq!(payload["event"], "REQUEST_CHANGES");
+    assert_eq!(payload["commit_id"], head.as_str());
+    assert_eq!(payload["body"], "Thanks");
+    assert_eq!(
+        payload["comments"][0],
+        serde_json::json!({"path": "src/lib.rs", "line": 3, "side": "RIGHT", "body": "**Blocking:** Please revert"})
+    );
+}
+
+#[test]
+fn pr_commits_missing_from_the_clone_explain_how_to_fetch() {
+    let (r, state) = (repo(), tempfile::tempdir().unwrap());
+    let gh = fake_gh(state.path(), &"0".repeat(40), &rev(r.path(), "main"), "author", "me");
+    let f = findings_file(state.path(), "src/lib.rs");
+    let out = pr_review_cmd(r.path(), state.path(), &gh, &f, &[]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("gh pr checkout 7"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn closed_prs_are_refused() {
+    let (r, state) = (repo(), tempfile::tempdir().unwrap());
+    let gh = fake_gh(state.path(), &rev(r.path(), "feature"), &rev(r.path(), "main"), "author", "me");
+    let pr = std::fs::read_to_string(state.path().join("pr.json")).unwrap().replace("\"open\"", "\"closed\"");
+    std::fs::write(state.path().join("pr.json"), pr).unwrap();
+    let f = findings_file(state.path(), "src/lib.rs");
+    let out = pr_review_cmd(r.path(), state.path(), &gh, &f, &[]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("o/r#7 is closed"));
+}
+
+#[test]
+fn pr_and_base_are_exclusive() {
+    let (r, state) = (repo(), tempfile::tempdir().unwrap());
+    let f = findings_file(state.path(), "src/lib.rs");
+    let out = review_cmd(r.path(), state.path(), &f, &["--pr", "7"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "clap rejects --base with --pr");
+    let out = prr().current_dir(r.path()).args(["review", "--findings"]).arg(&f).arg("--pending").output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "--pending needs --pr");
+}

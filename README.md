@@ -7,6 +7,7 @@ cargo install --path .
 prr guide          # how an agent drives it
 prr schema         # findings file format
 prr review --findings findings.json --base main
+prr review --findings findings.json --pr 42   # GitHub PR, posts on submit
 ```
 
 To install the Claude Code skill: `cp -r skills/prr ~/.claude/skills/`.

@@ -17,6 +17,16 @@ If your process dies, re-attach with `prr wait <session-id>`; `prr sessions --op
 
 Options: `--head <ref>` (default `HEAD`), `--findings -` to read stdin, `--export-md <path>` to also write the composed Review as markdown, `--no-open` to only print the URL, `--replace` to abandon an open session for the same change.
 
+## GitHub pull requests
+
+Review a pull request with `--pr` instead of `--base`/`--head`:
+
+    prr review --findings findings.json --pr 42
+
+`--pr` takes the PR number (in this clone's GitHub repository) or its URL. It needs the GitHub CLI (`gh`) logged in, and the PR's commits in this clone; if they are missing prr exits 1 and says to run `gh pr checkout 42`. When the Reviewer submits, prr posts the Review to the PR: one review, inline comments on changed lines, everything else in the body with permalinks. Add `--pending` to create a pending review the Reviewer finishes on GitHub instead. On the Reviewer's own PR GitHub only allows a comment review, so prr posts Blocks as comments marked Blocking.
+
+The result then also has `"posted": true`, `posted_url` and `posted_state`. If GitHub rejects the review, the Reviewer sees why and the session stays open.
+
 ## Exit codes
 
 | Code | Meaning |
