@@ -205,7 +205,7 @@ fn sessions(open_only: bool) -> Result<i32> {
 /// Serves the session until it ends, then prints the result and returns the exit code.
 pub(crate) fn run_server(session: Session, store: Store, repo: Repo, open_browser: bool) -> Result<i32> {
     let runtime = tokio::runtime::Runtime::new()?;
-    match runtime.block_on(server::serve_session(session, store, repo, open_browser))? {
+    match runtime.block_on(server::serve_session(session, store, repo, crate::github::Gh::from_env(), open_browser))? {
         ServeEnd::Interrupted(s) => {
             eprintln!("prr: interrupted; session {id} is still open — resume with `prr wait {id}`", id = s.id);
             Ok(exit::INTERRUPTED)

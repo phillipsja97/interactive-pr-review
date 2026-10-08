@@ -9,7 +9,7 @@ use super::highlight::code_block;
 use super::url;
 use crate::compose::ComposedReview;
 use crate::model::{Evidence, Finding, Location};
-use crate::session::{Origin, Session, Verdict};
+use crate::session::{Origin, Session, Target, Verdict};
 
 const VERDICTS: [(&str, &str, &str); 5] = [
     ("block", "Block", "b"),
@@ -229,6 +229,14 @@ pub fn submit(
     let t = &s.token;
     let unruled = s.unruled();
     let has_block = s.entries.iter().any(|e| e.ruling.as_ref().is_some_and(|r| r.verdict == Verdict::Block));
+    let own_pr = matches!(s.target, Target::Github { own_pr: true, .. });
+    let (destination, button) = match &s.target {
+        Target::Local { .. } => ("Local mode: nothing is posted.".to_string(), "Submit review"),
+        Target::Github { repo, number, pending: true, .. } => {
+            (format!("Creates a pending review on {repo}#{number} that you finish on GitHub."), "Create pending review")
+        }
+        Target::Github { repo, number, .. } => (format!("Posts the Review to {repo}#{number} on GitHub."), "Submit review to GitHub"),
+    };
     let body = html! {
         h1 { "Review & submit" }
         @if let Some(msg) = error { p.error { (msg) } }
@@ -249,13 +257,17 @@ pub fn submit(
                 }
                 label { "Summary (top of the Review)" textarea name="summary" rows="4" { (form.map_or("", |f| f.summary.as_str())) } }
                 label {
-                    input type="checkbox" name="approve" checked[form.is_some_and(|f| f.approve.is_some())] disabled[has_block];
+                    input type="checkbox" name="approve" checked[form.is_some_and(|f| f.approve.is_some())] disabled[has_block || own_pr];
                     " Approve"
                     @if has_block { " (not available: something is Blocked)" }
                 }
+                @if own_pr {
+                    p.hint { "This is your own pull request. GitHub only accepts a comment review on it, so Blocks are posted as comments marked Blocking, and Approve is not available." }
+                }
+                p.hint { (destination) }
                 p.hint { "If every Finding is dismissed: tick Approve to approve, write a summary to post a comment, or leave both empty to post nothing." }
                 @if let Some(path) = &s.export_md { p.hint { "The Review will be written to " code { (path.display()) } "." } }
-                button type="submit" { "Submit review" }
+                button type="submit" { (button) }
             }
             @if let Some(review) = preview {
                 section {

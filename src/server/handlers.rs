@@ -12,7 +12,8 @@ use crate::session::{Ruling, Session, SessionError, Verdict};
 use crate::validate::{check_repo_path, resolve_lines};
 
 use crate::compose::{cite_plain, compose, to_markdown, ComposedReview, SubmitChoice};
-use crate::session::{Outcome, SessionStatus};
+use crate::github::{permalink, review_event, review_payload};
+use crate::session::{Outcome, SessionStatus, Target};
 
 pub async fn index(State(st): State<AppState>) -> Redirect {
     let s = st.snapshot();
@@ -132,13 +133,21 @@ pub async fn submit_page(State(st): State<AppState>) -> Html<String> {
     Html(pages::submit(&s, preview(&st, &s).as_ref(), st.is_stale(), None, None).into_string())
 }
 
+/// Body citations: permalinks on GitHub, plain `path:lines` locally.
+pub fn cite_for(s: &Session) -> impl Fn(&str, u32, u32) -> String + '_ {
+    move |path, start, end| match s.target.github_repo() {
+        Some(repo) => permalink(&repo, &s.head_sha, path, start, end),
+        None => cite_plain(path, start, end),
+    }
+}
+
 /// The Review as it would be composed with no summary and no approval.
 fn preview(st: &AppState, s: &Session) -> Option<ComposedReview> {
     if !s.unruled().is_empty() {
         return None;
     }
     let diff = st.repo().diff_map(&s.base_sha, &s.head_sha).ok()?;
-    compose(&s.entries, &diff, &SubmitChoice::default(), &cite_plain).ok()
+    compose(&s.entries, &diff, &SubmitChoice::default(), &cite_for(s)).ok()
 }
 
 #[derive(Deserialize)]
@@ -167,19 +176,36 @@ pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) ->
     }
     let choice = SubmitChoice { approve: form.approve.is_some(), summary: form.summary.trim().to_string() };
     let diff = st.repo().diff_map(&s.base_sha, &s.head_sha).map_err(AppError::Internal)?;
-    // Compose, export and commit under the session lock, so a Verdict saved from another tab
+    let gh = st.gh().clone();
+    let root = st.repo().root().to_path_buf();
+    // Compose, export, post and commit under the session lock, so a Verdict saved from another tab
     // can never slip in between composing the Review and recording it.
     let committed = st.update(|s| {
         if !s.is_open() {
             return Err(SessionError::NotOpen);
         }
-        let review = compose(&s.entries, &diff, &choice, &cite_plain).map_err(|e| SessionError::Invalid(e.to_string()))?;
+        if choice.approve && matches!(s.target, Target::Github { own_pr: true, .. }) {
+            return Err(SessionError::Invalid("GitHub doesn't let you approve your own pull request.".into()));
+        }
+        let review = compose(&s.entries, &diff, &choice, &cite_for(s)).map_err(|e| SessionError::Invalid(e.to_string()))?;
         if let Some(path) = &s.export_md {
             std::fs::write(path, to_markdown(&review))
                 .map_err(|e| SessionError::Invalid(format!("Could not write the Review to {}: {e}", path.display())))?;
         }
+        let posted = match (&s.target, review.state) {
+            (Target::Github { number, own_pr, pending, .. }, Some(state)) => {
+                let repo = s.target.github_repo().expect("GitHub target");
+                let event = (!pending).then(|| review_event(state, *own_pr));
+                let payload = review_payload(&review, &s.head_sha, event);
+                let posted = gh
+                    .post_review(&root, &repo, *number, &payload)
+                    .map_err(|e| SessionError::Invalid(format!("GitHub did not accept the review: {e:#}")))?;
+                Some(posted)
+            }
+            _ => None,
+        };
         s.status = SessionStatus::Submitted;
-        s.outcome = Some(Outcome { state: review.state, summary: choice.summary.clone(), export_path: s.export_md.clone(), posted: None });
+        s.outcome = Some(Outcome { state: review.state, summary: choice.summary.clone(), export_path: s.export_md.clone(), posted });
         Ok(())
     });
     match committed {

@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use crate::git::Repo;
+use crate::github::Gh;
 use crate::session::{Session, SessionError, Store, Target};
 
 pub fn url(token: &str, rest: &str) -> String {
@@ -32,14 +33,15 @@ struct Inner {
     session: Mutex<Session>,
     store: Store,
     repo: Repo,
+    gh: Gh,
     port: u16,
     done: watch::Sender<bool>,
 }
 
 impl AppState {
-    pub fn new(session: Session, store: Store, repo: Repo, port: u16) -> AppState {
+    pub fn new(session: Session, store: Store, repo: Repo, gh: Gh, port: u16) -> AppState {
         let (done, _) = watch::channel(false);
-        AppState { inner: Arc::new(Inner { session: Mutex::new(session), store, repo, port, done }) }
+        AppState { inner: Arc::new(Inner { session: Mutex::new(session), store, repo, gh, port, done }) }
     }
 
     pub fn snapshot(&self) -> Session {
@@ -52,6 +54,10 @@ impl AppState {
 
     pub fn repo(&self) -> &Repo {
         &self.inner.repo
+    }
+
+    pub fn gh(&self) -> &Gh {
+        &self.inner.gh
     }
 
     pub fn port(&self) -> u16 {
@@ -73,7 +79,10 @@ impl AppState {
         let s = self.snapshot();
         match &s.target {
             Target::Local { head_ref, .. } => !self.inner.repo.rev_parse(head_ref).is_ok_and(|sha| sha == s.head_sha),
-            Target::Github { .. } => true,
+            Target::Github { number, .. } => {
+                let repo = s.target.github_repo().expect("GitHub target");
+                !self.inner.gh.pull(self.inner.repo.root(), &repo, *number).is_ok_and(|pr| pr.head_sha == s.head_sha)
+            }
         }
     }
 
@@ -154,13 +163,13 @@ pub enum ServeEnd {
 }
 
 /// Serves `session` on a random localhost port until the Reviewer finishes or the process is interrupted.
-pub async fn serve_session(session: Session, store: Store, repo: Repo, open_browser: bool) -> anyhow::Result<ServeEnd> {
+pub async fn serve_session(session: Session, store: Store, repo: Repo, gh: Gh, open_browser: bool) -> anyhow::Result<ServeEnd> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let link = format!("http://127.0.0.1:{port}{}", url(&session.token, ""));
     eprintln!("prr: session {}", session.id);
     eprintln!("prr: open {link}");
-    let state = AppState::new(session, store, repo, port);
+    let state = AppState::new(session, store, repo, gh, port);
     if open_browser && let Err(e) = webbrowser::open(&link) {
         eprintln!("prr: could not open a browser ({e}); open the URL above yourself");
     }
@@ -185,6 +194,8 @@ mod tests {
     use crate::session::{Store, Target};
     use crate::testutil::{sample_batch, sample_repo, TestRepo};
     use crate::session::{ReviewState, SessionStatus};
+    use crate::github::Gh;
+    use crate::testutil::FakeGh;
     use crate::validate::validate;
     use axum::body::Body;
     use axum::http::{HeaderMap, Request as HttpRequest};
@@ -219,12 +230,111 @@ mod tests {
             entries,
             export_md,
         );
+        serve(repo, session, Gh::new("gh", vec![]))
+    }
+
+    fn serve(repo: TestRepo, session: Session, gh: Gh) -> Fixture {
         let state_dir = tempfile::tempdir().unwrap();
         let store = Store::new(state_dir.path().to_path_buf());
         store.save(&session).unwrap();
         let (token, id) = (session.token.clone(), session.id.clone());
-        let state = AppState::new(session, store.clone(), repo.repo(), PORT);
+        let state = AppState::new(session, store.clone(), repo.repo(), gh, PORT);
         Fixture { app: router(state.clone()), repo, _state_dir: state_dir, store, state, token, id }
+    }
+
+    /// A session for o/r#7 whose fake `gh` reports the sample repo's commits; "author" opened the PR.
+    fn github_fixture(own_pr: bool, pending: bool) -> (Fixture, FakeGh, String) {
+        let (repo, base, head) = sample_repo();
+        let fake = FakeGh::new(&head, &base, "author", if own_pr { "author" } else { "me" });
+        let entries = validate(sample_batch(), &repo.repo(), &head).unwrap();
+        let target = Target::Github { host: "github.com".into(), repo: "o/r".into(), number: 7, own_pr, pending };
+        let session = Session::new(repo.repo().root().to_path_buf(), target, base, head.clone(), entries, None);
+        (serve(repo, session, fake.gh()), fake, head)
+    }
+
+    #[tokio::test]
+    async fn github_submit_posts_the_review_and_records_it() {
+        let (fx, fake, head) = github_fixture(false, false);
+        rule_all(&fx, "block").await;
+        let (_, _, page) = fx.get("submit").await;
+        assert!(page.contains("Posts the Review to o/r#7 on GitHub"), "{page}");
+        let (s, _, body) = fx.post("submit", "summary=Thanks").await;
+        assert_eq!(s, StatusCode::OK, "{body}");
+
+        let p = fake.payload().expect("review was posted");
+        assert_eq!(p["event"], "REQUEST_CHANGES");
+        assert_eq!(p["commit_id"], head.as_str());
+        assert_eq!(p["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(p["comments"][0]["start_line"], 10);
+        assert_eq!(p["comments"][0]["line"], 12);
+        let link = format!("[`src/lib.rs:1-2`](https://github.com/o/r/blob/{head}/src/lib.rs#L1-L2)");
+        assert!(p["body"].as_str().unwrap().contains(&link), "{}", p["body"]);
+
+        let posted = fx.store.load(&fx.id).unwrap().outcome.unwrap().posted.unwrap();
+        assert_eq!(posted.url, "https://github.com/o/r/pull/7#pullrequestreview-1");
+    }
+
+    #[tokio::test]
+    async fn own_pr_posts_a_comment_and_refuses_approve() {
+        let (fx, fake, _) = github_fixture(true, false);
+        rule_all(&fx, "comment").await;
+        let (_, _, page) = fx.get("submit").await;
+        assert!(page.contains("your own pull request"), "{page}");
+        let (s, _, body) = fx.post("submit", "approve=on").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("approve your own pull request"), "{body}");
+        assert!(fake.payload().is_none());
+
+        fx.post("f/0/ruling", "verdict=block&comment=Must+fix").await;
+        let (s, _, _) = fx.post("submit", "summary=").await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(fake.payload().unwrap()["event"], "COMMENT", "GitHub refuses REQUEST_CHANGES on your own PR");
+    }
+
+    #[tokio::test]
+    async fn pending_review_has_no_event() {
+        let (fx, fake, _) = github_fixture(false, true);
+        rule_all(&fx, "comment").await;
+        let (_, _, page) = fx.get("submit").await;
+        assert!(page.contains("Create pending review"), "{page}");
+        fx.post("submit", "summary=").await;
+        assert!(fake.payload().unwrap().get("event").is_none());
+    }
+
+    #[tokio::test]
+    async fn github_rejection_keeps_the_session_open() {
+        let (fx, fake, _) = github_fixture(false, false);
+        rule_all(&fx, "comment").await;
+        fake.fail_reviews("gh: Validation Failed (HTTP 422)");
+        let (s, _, body) = fx.post("submit", "summary=Keep+me").await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(body.contains("GitHub did not accept the review") && body.contains("Validation Failed"), "{body}");
+        assert!(body.contains("Keep me"));
+        let saved = fx.store.load(&fx.id).unwrap();
+        assert!(saved.is_open() && saved.outcome.is_none());
+        assert!(!*fx.state.subscribe().borrow());
+    }
+
+    #[tokio::test]
+    async fn nothing_to_post_makes_no_api_call() {
+        let (fx, fake, _) = github_fixture(false, false);
+        fx.post("f/0/ruling", "verdict=dismiss&reason=noise").await;
+        fx.post("f/1/ruling", "verdict=dismiss&reason=noise").await;
+        let (s, _, _) = fx.post("submit", "summary=").await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(fake.payload().is_none());
+        assert!(!fake.calls().contains("/reviews"));
+    }
+
+    #[tokio::test]
+    async fn github_stale_when_the_pr_head_moves() {
+        let (fx, fake, _) = github_fixture(false, false);
+        rule_all(&fx, "comment").await;
+        let (_, _, page) = fx.get("submit").await;
+        assert!(!page.contains("new commits"));
+        fake.set_pr(&"9".repeat(40), &"b".repeat(40), "author");
+        let (_, _, page) = fx.get("submit").await;
+        assert!(page.contains("new commits"), "{page}");
     }
 
     impl Fixture {
