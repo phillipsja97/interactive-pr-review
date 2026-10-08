@@ -179,7 +179,7 @@ pub async fn submit(State(st): State<AppState>, Form(form): Form<SubmitForm>) ->
                 .map_err(|e| SessionError::Invalid(format!("Could not write the Review to {}: {e}", path.display())))?;
         }
         s.status = SessionStatus::Submitted;
-        s.outcome = Some(Outcome { state: review.state, summary: choice.summary.clone(), export_path: s.export_md.clone() });
+        s.outcome = Some(Outcome { state: review.state, summary: choice.summary.clone(), export_path: s.export_md.clone(), posted: None });
         Ok(())
     });
     match committed {

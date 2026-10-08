@@ -16,6 +16,10 @@ pub struct ReviewResult {
     pub export_path: Option<PathBuf>,
     /// Whether the Review was posted to a Code host. Always false in local mode.
     pub posted: bool,
+    /// Link to the posted review, when one was posted.
+    pub posted_url: Option<String>,
+    /// The Code host's state for the posted review, e.g. `CHANGES_REQUESTED` or `PENDING`.
+    pub posted_state: Option<String>,
     pub findings: Vec<ResultFinding>,
 }
 
@@ -64,7 +68,9 @@ impl ReviewResult {
             review_state: outcome.and_then(|o| o.state),
             summary: outcome.map(|o| o.summary.clone()).unwrap_or_default(),
             export_path: outcome.and_then(|o| o.export_path.clone()),
-            posted: false,
+            posted: outcome.and_then(|o| o.posted.as_ref()).is_some(),
+            posted_url: outcome.and_then(|o| o.posted.as_ref()).map(|p| p.url.clone()),
+            posted_state: outcome.and_then(|o| o.posted.as_ref()).map(|p| p.state.clone()),
             findings,
         }
     }
@@ -101,13 +107,14 @@ mod tests {
             None,
         );
         s.status = SessionStatus::Submitted;
-        s.outcome = Some(Outcome { state: Some(ReviewState::Comment), summary: "hi".into(), export_path: None });
+        s.outcome = Some(Outcome { state: Some(ReviewState::Comment), summary: "hi".into(), export_path: None, posted: None });
 
         let v = serde_json::to_value(ReviewResult::from_session(&s)).unwrap();
         assert_eq!(v["status"], "submitted");
         assert_eq!(v["review_state"], "comment");
         assert_eq!(v["summary"], "hi");
         assert_eq!(v["posted"], false);
+        assert_eq!(v["posted_url"], serde_json::Value::Null);
         assert_eq!(v["findings"][0]["verdict"], "dismiss");
         assert_eq!(v["findings"][0]["dismiss_reason"], "dup");
         assert_eq!(v["findings"][1]["escalate_to"], "@ops");

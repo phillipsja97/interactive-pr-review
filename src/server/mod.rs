@@ -73,6 +73,7 @@ impl AppState {
         let s = self.snapshot();
         match &s.target {
             Target::Local { head_ref, .. } => !self.inner.repo.rev_parse(head_ref).is_ok_and(|sha| sha == s.head_sha),
+            Target::Github { .. } => true,
         }
     }
 

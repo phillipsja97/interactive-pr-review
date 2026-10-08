@@ -18,12 +18,22 @@ pub const REVIEWER_ID_PREFIX: &str = "reviewer-";
 pub enum Target {
     /// A local git range with no Code host.
     Local { base_ref: String, head_ref: String },
+    /// A GitHub pull request; `repo` is `owner/name`.
+    Github { host: String, repo: String, number: u64, own_pr: bool, pending: bool },
 }
 
 impl Target {
     pub fn label(&self) -> String {
         match self {
             Target::Local { base_ref, head_ref } => format!("{base_ref}...{head_ref}"),
+            Target::Github { repo, number, .. } => format!("{repo}#{number}"),
+        }
+    }
+
+    pub fn github_repo(&self) -> Option<crate::github::GithubRepo> {
+        match self {
+            Target::Github { host, repo, .. } => Some(crate::github::GithubRepo { host: host.clone(), name: repo.clone() }),
+            Target::Local { .. } => None,
         }
     }
 }
@@ -200,11 +210,21 @@ impl Entry {
     }
 }
 
+/// A Review as accepted by the Code host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Posted {
+    pub url: String,
+    /// The host's state for the review, e.g. `COMMENTED` or `PENDING`.
+    pub state: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Outcome {
     pub state: Option<ReviewState>,
     pub summary: String,
     pub export_path: Option<PathBuf>,
+    #[serde(default)]
+    pub posted: Option<Posted>,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -600,7 +620,7 @@ mod tests {
 
         let mut done = session(vec![]);
         done.status = SessionStatus::Submitted;
-        done.outcome = Some(Outcome { state: Some(ReviewState::Comment), summary: "hi".into(), export_path: None });
+        done.outcome = Some(Outcome { state: Some(ReviewState::Comment), summary: "hi".into(), export_path: None, posted: None });
         store.save(&done).unwrap();
         store.abandon_open(&done.id).unwrap();
         assert_eq!(store.load(&done.id).unwrap(), done, "a submitted session is left alone");

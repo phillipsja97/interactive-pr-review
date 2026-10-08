@@ -9,3 +9,4 @@ pub mod compose;
 pub mod result;
 pub mod server;
 pub mod guide;
+pub mod github;
