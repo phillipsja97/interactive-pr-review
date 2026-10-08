@@ -72,7 +72,15 @@ Bind `127.0.0.1` on a random port; every route lives under a random per-session 
 
 ## GitHub adapter (plan 2)
 
-`prr review --pr <n>` resolves base/head from the PR via `gh api`; staleness is checked against the PR's current head SHA; submit posts one review (`event` from the Review state, inline comments with `line`/`start_line`, side RIGHT) after the explicit submit step; `--pending` creates a pending review instead; body citations become permalinks at the head SHA; `posted` becomes true.
+- `prr review --pr <number|url>` (instead of `--base`/`--head`) identifies the PR; a bare number means the clone's own GitHub repository (`gh repo view`). Base/head SHAs come from `gh api`; the Review's base is their merge-base. Only open PRs can be reviewed.
+- The PR's head and base commits must already be in the clone; otherwise prr exits 1 telling the Agent to run `gh pr checkout <n>` (prr never fetches).
+- Staleness is checked against the PR's current head on GitHub (an unreachable GitHub counts as stale).
+- Submit posts one review (`POST /pulls/{n}/reviews`): `commit_id` = head SHA, `event` from the Review state, inline comments with `line`, `side: RIGHT` and, for ranges, `start_line`/`start_side`. Body citations become permalinks at the head SHA. Nothing to post → no API call.
+- `--pending` omits `event`, creating a pending review the Reviewer finishes on GitHub.
+- On the Reviewer's own PR GitHub refuses REQUEST_CHANGES and APPROVE: prr posts COMMENT (Blocks keep their `**Blocking:**` label) and disables Approve.
+- If GitHub rejects the review, the submit page shows GitHub's message and the session stays open.
+- The result gains `posted: true`, `posted_url` and `posted_state` (GitHub's review state).
+- prr talks to GitHub only through the `gh` CLI (its auth, its host); `PRR_GH` overrides the command (whitespace-separated), which is how tests substitute a fake.
 
 ## External reviewers (plan 3)
 
